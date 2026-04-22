@@ -1,0 +1,64 @@
+# Self-validate: lint this repo's own reusable workflows.
+#
+# Runs actionlint + yamllint against .github/workflows/ so broken reusable
+# workflows cannot land. Does NOT call its own reusable workflows (that would
+# require circular `uses:` and a published SHA); consuming repos exercise the
+# functional behavior instead.
+
+name: Self-validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: read-all
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Run actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install yamllint
+        run: |
+          python -m pip install --upgrade pip
+          pip install yamllint==1.35.1
+      - name: Run yamllint
+        run: yamllint -d "{extends: default, rules: {line-length: {max: 160}, truthy: {allowed-values: ['true', 'false', 'on', 'off']}, comments: {min-spaces-from-content: 1}}}" .github/
+
+  ci-all:
+    name: CI all
+    needs: [actionlint, yamllint]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fan-in succeeded
+        run: echo "ci-shared self-validation passed."

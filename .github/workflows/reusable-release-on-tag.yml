@@ -1,0 +1,83 @@
+# Reusable: GitHub Release on `v*` tag push.
+#
+# Creates a GitHub Release when a semver tag is pushed. Body is generated
+# from changes since the previous tag via gh-release-action auto-body.
+# Optionally includes the relevant CHANGELOG.md section if present.
+#
+# Not derived from an existing gmail-mcp workflow; this is the "default
+# release-when-tagged" slot referenced in the handoff plan. Promote into
+# gmail-mcp CI as a follow-up PR.
+
+name: Reusable - Release on tag
+
+on:
+  workflow_call:
+    inputs:
+      changelog-path:
+        description: "Path to CHANGELOG.md; if present, its top section is included in the release body."
+        type: string
+        required: false
+        default: CHANGELOG.md
+      prerelease:
+        description: "Mark release as prerelease (e.g. for v*-rc.* tags)."
+        type: boolean
+        required: false
+        default: false
+      generate-release-notes:
+        description: "Let GitHub auto-generate release notes from commits/PRs."
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Extract tag
+        id: tag
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF#refs/tags/}"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+      - name: Extract changelog section (best-effort)
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          CL="${{ inputs.changelog-path }}"
+          body_file="$(mktemp)"
+          if [ -f "$CL" ]; then
+            # Grab content between the first `## ` heading and the next, stripping the heading itself.
+            awk '/^## / {n++; if (n==2) exit} n==1 && !/^## /' "$CL" > "$body_file" || true
+          fi
+          if [ ! -s "$body_file" ]; then
+            echo "No changelog body extracted; relying on auto-generated notes." > "$body_file"
+          fi
+          {
+            echo "body<<EOF"
+            cat "$body_file"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191  # v2.3.4
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: ${{ steps.changelog.outputs.body }}
+          draft: false
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: ${{ inputs.generate-release-notes }}

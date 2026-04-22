@@ -1,0 +1,75 @@
+# Reusable: Semgrep SAST (OWASP / language / secrets / CI rulepacks).
+#
+# Derived from salucallc/gmail-mcp .github/workflows/ci.yml (semgrep job).
+# Semgrep version is pinned at workflow level (Dependabot does not bump
+# pip-installed tools inside workflows). Bump in lockstep with rulepack review.
+
+name: Reusable - Semgrep
+
+on:
+  workflow_call:
+    inputs:
+      configs:
+        description: "Newline-separated list of semgrep configs (e.g. p/owasp-top-ten)."
+        type: string
+        required: false
+        default: |
+          p/owasp-top-ten
+          p/python
+          p/secrets
+          p/ci
+      severity:
+        description: "Minimum severity that fails the job (ERROR|WARNING|INFO)."
+        type: string
+        required: false
+        default: ERROR
+      semgrep-version:
+        description: "Pinned semgrep version."
+        type: string
+        required: false
+        default: "1.160.0"
+      python-version:
+        description: "Python version to set up for semgrep."
+        type: string
+        required: false
+        default: "3.12"
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+jobs:
+  semgrep:
+    name: Semgrep (OWASP / language / secrets / CI)
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install semgrep (pinned)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "semgrep==${{ inputs.semgrep-version }}"
+      - name: Run semgrep
+        env:
+          SEMGREP_CONFIGS: ${{ inputs.configs }}
+          SEMGREP_SEVERITY: ${{ inputs.severity }}
+        run: |
+          set -euo pipefail
+          semgrep --version
+          config_flags=()
+          while IFS= read -r cfg; do
+            cfg="$(echo "$cfg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            if [ -n "$cfg" ]; then
+              config_flags+=(--config "$cfg")
+            fi
+          done <<< "$SEMGREP_CONFIGS"
+          semgrep "${config_flags[@]}" --severity="$SEMGREP_SEVERITY" --error .

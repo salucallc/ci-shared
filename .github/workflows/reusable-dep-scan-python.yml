@@ -1,0 +1,56 @@
+# Reusable: Python dependency CVE scan (pip-audit + safety matrix).
+#
+# Derived from salucallc/gmail-mcp .github/workflows/ci.yml (dep-scan job).
+# Runs pip-audit --strict and safety check against the requirements file in
+# parallel matrix legs; either leg can fail the job.
+
+name: Reusable - Python dependency CVE scan
+
+on:
+  workflow_call:
+    inputs:
+      requirements-file:
+        description: "Path to pip requirements file to scan."
+        type: string
+        required: false
+        default: requirements.txt
+      python-version:
+        description: "Python version to set up for the scanners."
+        type: string
+        required: false
+        default: "3.12"
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+jobs:
+  dep-scan:
+    name: Python dep CVE scan
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [pip-audit, safety]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install scanner (${{ matrix.tool }})
+        run: |
+          python -m pip install --upgrade pip
+          pip install ${{ matrix.tool }}
+      - name: Run pip-audit
+        if: matrix.tool == 'pip-audit'
+        run: pip-audit --strict -r ${{ inputs.requirements-file }}
+      - name: Run safety
+        if: matrix.tool == 'safety'
+        run: safety check -r ${{ inputs.requirements-file }} --full-report

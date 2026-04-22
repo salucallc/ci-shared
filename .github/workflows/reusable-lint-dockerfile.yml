@@ -1,0 +1,42 @@
+# Reusable: Hadolint Dockerfile lint.
+#
+# Derived from salucallc/gmail-mcp .github/workflows/ci.yml (lint-dockerfile job).
+# Third-party actions pinned to commit SHA, not tag.
+
+name: Reusable - Lint Dockerfile
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: "Path to the Dockerfile to lint (relative to repo root)."
+        type: string
+        required: false
+        default: Dockerfile
+      failure-threshold:
+        description: "Minimum Hadolint severity that fails the job (error|warning|info|style|ignore)."
+        type: string
+        required: false
+        default: warning
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+jobs:
+  lint-dockerfile:
+    name: Lint Dockerfile (hadolint)
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Hadolint
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5  # v3.3.0
+        with:
+          dockerfile: ${{ inputs.dockerfile }}
+          failure-threshold: ${{ inputs.failure-threshold }}
