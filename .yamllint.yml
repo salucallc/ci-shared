@@ -1,0 +1,13 @@
+# yamllint config for self-validate.yml. Kept in a file because an inline
+# -d "{...: ...}" mapping inside a plain YAML scalar is itself invalid YAML,
+# which is what broke the first run of this workflow.
+extends: default
+rules:
+  line-length:
+    max: 160
+  truthy:
+    allowed-values: ["true", "false", "on", "off"]
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  document-start: disable
