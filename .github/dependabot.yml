@@ -1,0 +1,23 @@
+# Dependabot for salucallc/ci-shared.
+#
+# This repo only contains reusable workflows, so only the github-actions
+# ecosystem is relevant. Dependabot bumps SHA-pinned third-party actions
+# weekly. Pinned pip-installed tools referenced inside workflows (e.g.
+# semgrep==1.160.0) are NOT managed by Dependabot; bump those in follow-up
+# PRs alongside any rulepack review.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    target-branch: "main"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "security"
+    commit-message:
+      prefix: "deps(actions)"
+      include: "scope"

@@ -1,0 +1,61 @@
+# Reusable: Docker Buildx smoke build.
+#
+# Derived from salucallc/gmail-mcp .github/workflows/ci.yml (build-smoke job).
+# Loads the image into the local Docker daemon so downstream scanners (e.g.
+# reusable-image-cve-scan) can consume it via the same tag.
+
+name: Reusable - Docker build smoke
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: "Build context path."
+        type: string
+        required: false
+        default: "."
+      dockerfile:
+        description: "Dockerfile path (relative to context)."
+        type: string
+        required: false
+        default: Dockerfile
+      image-name:
+        description: "Base image name (no tag). Full tag is `<image-name>:ci-<sha>`."
+        type: string
+        required: true
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+    outputs:
+      image-ref:
+        description: "Full image reference built by this workflow."
+        value: ${{ jobs.build-smoke.outputs.image-ref }}
+
+permissions: {}
+
+jobs:
+  build-smoke:
+    name: Docker build smoke
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    outputs:
+      image-ref: ${{ steps.compute-ref.outputs.image-ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Compute image ref
+        id: compute-ref
+        run: echo "image-ref=${{ inputs.image-name }}:ci-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+      - name: Build image (local load)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: false
+          load: true
+          tags: ${{ steps.compute-ref.outputs.image-ref }}

@@ -1,0 +1,58 @@
+# Reusable: Python SAST (bandit).
+#
+# Derived from salucallc/gmail-mcp .github/workflows/ci.yml (sast-python job).
+# Default severity/confidence thresholds match the gmail-mcp baseline (medium/medium);
+# bump to high/high once the backlog is triaged.
+
+name: Reusable - Python SAST (bandit)
+
+on:
+  workflow_call:
+    inputs:
+      target-paths:
+        description: "Space-separated paths or files to scan (passed to bandit -r)."
+        type: string
+        required: false
+        default: "."
+      severity-level:
+        description: "Minimum severity that fails the job (low|medium|high)."
+        type: string
+        required: false
+        default: medium
+      confidence-level:
+        description: "Minimum confidence that fails the job (low|medium|high)."
+        type: string
+        required: false
+        default: medium
+      python-version:
+        description: "Python version to set up for bandit."
+        type: string
+        required: false
+        default: "3.12"
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+jobs:
+  sast-python:
+    name: Python SAST (bandit)
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install bandit
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit
+      - name: Run bandit
+        run: bandit -r ${{ inputs.target-paths }} --severity-level ${{ inputs.severity-level }} --confidence-level ${{ inputs.confidence-level }}
