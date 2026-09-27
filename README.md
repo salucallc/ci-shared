@@ -47,6 +47,8 @@ jobs:
 This repo is public, so private repos in both `salucallc` and `saluca-labs` can call it (a private
 reusable workflow could only be shared inside its own org).
 
+`tools/write_caller.py` writes that caller file for a repo (`--node DIR[:k=v,...]`, `--python DIR[:k=v,...]`, `--branch`, `--sha`); it refuses a SHA that is not a full 40-character commit.
+
 `tools/ci_inventory.py` lists every repo in both orgs with its stack, workflows, default-branch CI
 state and open dependency PRs (read-only, through `gh`).
 
