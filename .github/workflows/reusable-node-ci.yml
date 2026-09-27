@@ -1,0 +1,153 @@
+# Reusable: Node / TypeScript CI - install, typecheck, build, test.
+#
+# One job, least privilege (contents: read), no secrets. Package manager from the lockfile:
+# pnpm-lock.yaml -> pnpm (via corepack), yarn.lock -> yarn (via corepack), otherwise npm.
+#
+# Each *-command input takes one of:
+#   auto   detect from package.json scripts (the default)
+#   skip   do not run this step (the log says so)
+#   <cmd>  run this shell command instead
+#
+# auto rules:
+#   install    frozen lockfile install (npm ci / pnpm install --frozen-lockfile / yarn immutable)
+#   typecheck  the first present of the scripts typecheck, type-check, check:types, lint:types;
+#              else, with a tsconfig.json and no build script, tsc --noEmit
+#   build      the build script, if present
+#   test       test:run if present (avoids watch-mode vitest), else test, unless test is the
+#              npm placeholder ("no test specified"). CI=true is set, so vitest runs once.
+
+name: Reusable - Node CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node version."
+        type: string
+        required: false
+        default: "22"
+      working-directory:
+        description: "Directory to run in, relative to the repo root."
+        type: string
+        required: false
+        default: "."
+      install-command:
+        description: "auto | skip | a shell command."
+        type: string
+        required: false
+        default: auto
+      typecheck-command:
+        description: "auto | skip | a shell command."
+        type: string
+        required: false
+        default: auto
+      build-command:
+        description: "auto | skip | a shell command."
+        type: string
+        required: false
+        default: auto
+      test-command:
+        description: "auto | skip | a shell command."
+        type: string
+        required: false
+        default: auto
+      timeout-minutes:
+        description: "Job timeout."
+        type: number
+        required: false
+        default: 20
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+jobs:
+  node-ci:
+    name: Node CI
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      INSTALL_CMD: ${{ inputs.install-command }}
+      TYPECHECK_CMD: ${{ inputs.typecheck-command }}
+      BUILD_CMD: ${{ inputs.build-command }}
+      TEST_CMD: ${{ inputs.test-command }}
+      CI: "true"
+      HUSKY: "0"
+      # Exit 0 when package.json defines the script named in argv[1] and it is not the npm placeholder.
+      HAS_SCRIPT_JS: >-
+        let s = {}; try { s = JSON.parse(require("fs").readFileSync("package.json", "utf8")).scripts || {}; }
+        catch (e) { process.exit(1); } const v = s[process.argv[1]];
+        process.exit(v && !/no test specified/.test(v) ? 0 : 1);
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Detect package manager
+        run: |
+          set -euo pipefail
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm; elif [ -f yarn.lock ]; then pm=yarn; else pm=npm; fi
+          if [ "$pm" != npm ]; then corepack enable; fi
+          echo "PM=$pm" >> "$GITHUB_ENV"
+          echo "package manager: $pm"
+      - name: Install
+        run: |
+          set -euo pipefail
+          if [ "$INSTALL_CMD" = "skip" ]; then echo "::notice::install skipped by input"; exit 0; fi
+          if [ "$INSTALL_CMD" != "auto" ]; then bash -euo pipefail -c "$INSTALL_CMD"; exit 0; fi
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn)
+              if yarn --version | grep -q '^1\.'; then yarn install --frozen-lockfile; else yarn install --immutable; fi ;;
+            npm)
+              if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+                npm ci --no-audit --no-fund
+              else
+                echo "::warning::no lockfile; npm install resolves fresh versions"
+                npm install --no-audit --no-fund
+              fi ;;
+          esac
+      - name: Typecheck
+        run: |
+          set -euo pipefail
+          hs() { node -e "$HAS_SCRIPT_JS" "$1"; }
+          if [ "$TYPECHECK_CMD" = "skip" ]; then echo "::notice::typecheck skipped by input"; exit 0; fi
+          if [ "$TYPECHECK_CMD" != "auto" ]; then bash -euo pipefail -c "$TYPECHECK_CMD"; exit 0; fi
+          for s in typecheck type-check check:types lint:types; do
+            if hs "$s"; then "$PM" run "$s"; exit 0; fi
+          done
+          if [ -f tsconfig.json ] && ! hs build; then
+            if [ -x node_modules/.bin/tsc ]; then node_modules/.bin/tsc --noEmit; exit 0; fi
+            echo "::notice::tsconfig.json present but typescript is not installed; typecheck did not run"
+            exit 0
+          fi
+          echo "::notice::no typecheck script (the build step, if any, type-checks)"
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_CMD" = "skip" ]; then echo "::notice::build skipped by input"; exit 0; fi
+          if [ "$BUILD_CMD" != "auto" ]; then bash -euo pipefail -c "$BUILD_CMD"; exit 0; fi
+          if node -e "$HAS_SCRIPT_JS" build; then "$PM" run build
+          else echo "::notice::no build script; build did not run"; fi
+      - name: Test
+        run: |
+          set -euo pipefail
+          hs() { node -e "$HAS_SCRIPT_JS" "$1"; }
+          if [ "$TEST_CMD" = "skip" ]; then echo "::notice::tests skipped by input"; exit 0; fi
+          if [ "$TEST_CMD" != "auto" ]; then bash -euo pipefail -c "$TEST_CMD"; exit 0; fi
+          if hs test:run; then "$PM" run test:run
+          elif hs test; then "$PM" run test
+          else echo "::notice::no test script; the test step did not run (this is not a pass)"; fi

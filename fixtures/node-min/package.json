@@ -1,0 +1,9 @@
+{
+  "name": "ci-shared-node-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "node -e \"require('./index.js')\"",
+    "test": "node --test"
+  }
+}

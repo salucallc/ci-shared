@@ -1,0 +1,31 @@
+# Self-test: run the stack workflows against the fixtures in this repo.
+#
+# self-validate.yml lints the workflow files; this proves they actually run. It calls them by
+# local path, so a PR is tested against its own version of the workflows before any consumer
+# pins the new SHA.
+
+name: Self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  python-fixture:
+    uses: ./.github/workflows/reusable-python-ci.yml
+    with:
+      working-directory: fixtures/python-min
+  node-fixture:
+    uses: ./.github/workflows/reusable-node-ci.yml
+    with:
+      working-directory: fixtures/node-min
