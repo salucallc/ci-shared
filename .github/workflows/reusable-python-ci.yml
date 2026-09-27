@@ -1,0 +1,171 @@
+# Reusable: Python CI - install, compileall, pytest when the repo has tests.
+#
+# One job, least privilege (contents: read), no secrets. Every step is overridable so a repo
+# with an unusual layout adopts this by setting inputs rather than forking the workflow.
+#
+# Each *-command input takes one of:
+#   auto   detect from the repo (the default; the rules are below)
+#   skip   do not run this step (the log says so; a skipped step is never reported as a pass)
+#   <cmd>  run this shell command instead
+#
+# Install (auto): uv.lock -> uv sync --frozen; poetry.lock -> poetry install;
+#   requirements*.txt -> pip install -r; pyproject.toml / setup.py -> pip install -e ".[dev,test]".
+# Test (auto): a tests/ or test/ directory, a pytest config, conftest.py, or test_*.py / *_test.py
+#   files -> python -m pytest -q. pytest exit code 5 (tests detected, none collected) FAILS the
+#   job: a suite that silently stops collecting is broken, not green.
+
+name: Reusable - Python CI
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version."
+        type: string
+        required: false
+        default: "3.12"
+      working-directory:
+        description: "Directory to run in, relative to the repo root."
+        type: string
+        required: false
+        default: "."
+      install-command:
+        description: "auto | skip | a shell command."
+        type: string
+        required: false
+        default: auto
+      compile-command:
+        description: "auto (python -m compileall) | skip | a shell command."
+        type: string
+        required: false
+        default: auto
+      test-command:
+        description: "auto (pytest when tests exist) | skip | a shell command."
+        type: string
+        required: false
+        default: auto
+      extra-packages:
+        description: "Space-separated packages to install after the project (e.g. pytest-asyncio)."
+        type: string
+        required: false
+        default: ""
+      apt-packages:
+        description: "Space-separated apt packages a build needs (e.g. libpq-dev)."
+        type: string
+        required: false
+        default: ""
+      timeout-minutes:
+        description: "Job timeout."
+        type: number
+        required: false
+        default: 20
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+jobs:
+  python-ci:
+    name: Python CI
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      INSTALL_CMD: ${{ inputs.install-command }}
+      COMPILE_CMD: ${{ inputs.compile-command }}
+      TEST_CMD: ${{ inputs.test-command }}
+      EXTRA_PACKAGES: ${{ inputs.extra-packages }}
+      APT_PACKAGES: ${{ inputs.apt-packages }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: System packages
+        if: ${{ inputs.apt-packages != '' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          # shellcheck disable=SC2086
+          sudo apt-get install -y -q $APT_PACKAGES
+      - name: Install
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ "$INSTALL_CMD" = "skip" ]; then
+            echo "::notice::install skipped by input"
+          elif [ "$INSTALL_CMD" != "auto" ]; then
+            bash -euo pipefail -c "$INSTALL_CMD"
+          elif [ -f uv.lock ]; then
+            echo "install: uv.lock -> uv sync --frozen --all-extras"
+            python -m pip install uv
+            uv sync --frozen --all-extras
+            echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+            echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+            echo "PIP_MODE=uv" >> "$GITHUB_ENV"
+          elif [ -f poetry.lock ]; then
+            echo "install: poetry.lock -> poetry install"
+            python -m pip install poetry
+            poetry config virtualenvs.create false
+            poetry install --no-interaction
+          else
+            found=0
+            for f in requirements.txt requirements-dev.txt requirements_dev.txt dev-requirements.txt \
+                     requirements-test.txt requirements_test.txt test-requirements.txt; do
+              if [ -f "$f" ]; then echo "install: $f"; python -m pip install -r "$f"; found=1; fi
+            done
+            if [ -f setup.py ] || { [ -f pyproject.toml ] && grep -qE '^\[(project|tool\.poetry)\]' pyproject.toml; }; then
+              echo "install: project -> pip install -e .[dev,test]"
+              python -m pip install -e ".[dev,test]"
+              found=1
+            fi
+            if [ "$found" = 0 ]; then echo "::notice::no Python manifest found; nothing installed"; fi
+          fi
+          if [ -n "$EXTRA_PACKAGES" ]; then
+            if [ "${PIP_MODE:-}" = uv ]; then
+              # shellcheck disable=SC2086
+              VIRTUAL_ENV="$PWD/.venv" uv pip install $EXTRA_PACKAGES
+            else
+              # shellcheck disable=SC2086
+              python -m pip install $EXTRA_PACKAGES
+            fi
+          fi
+      - name: Compile (syntax check)
+        run: |
+          set -euo pipefail
+          if [ "$COMPILE_CMD" = "skip" ]; then echo "::notice::compile skipped by input"; exit 0; fi
+          if [ "$COMPILE_CMD" != "auto" ]; then bash -euo pipefail -c "$COMPILE_CMD"; exit 0; fi
+          python -m compileall -q -x '(^|/)(\.venv|venv|\.git|node_modules|build|dist|site-packages)(/|$)' .
+      - name: Test
+        run: |
+          set -euo pipefail
+          if [ "$TEST_CMD" = "skip" ]; then echo "::notice::tests skipped by input"; exit 0; fi
+          if [ "$TEST_CMD" != "auto" ]; then bash -euo pipefail -c "$TEST_CMD"; exit 0; fi
+          has_tests=0
+          if [ -d tests ] || [ -d test ] || [ -f pytest.ini ] || [ -f conftest.py ]; then has_tests=1; fi
+          if [ -f pyproject.toml ] && grep -q '^\[tool\.pytest' pyproject.toml; then has_tests=1; fi
+          if [ -f setup.cfg ] && grep -q '^\[tool:pytest\]' setup.cfg; then has_tests=1; fi
+          if [ "$has_tests" = 0 ] && [ -n "$(find . \( -path ./.venv -o -path ./node_modules -o -path ./.git \) -prune -o \
+               \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)" ]; then has_tests=1; fi
+          if [ "$has_tests" = 0 ]; then
+            echo "::notice::no Python tests found; the test step did not run (this is not a pass)"
+            exit 0
+          fi
+          if ! python -c "import pytest" 2>/dev/null; then
+            if [ "${PIP_MODE:-}" = uv ]; then uv pip install pytest; else python -m pip install pytest; fi
+          fi
+          python -m pytest -q

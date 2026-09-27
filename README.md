@@ -18,6 +18,37 @@ All workflows live in `.github/workflows/` and are invoked with `workflow_call`.
 | `reusable-build-smoke-docker.yml` | Buildx smoke build of a Dockerfile | `context`, `dockerfile`, `image-tag` |
 | `reusable-image-cve-scan.yml` | Trivy scan of a locally built image | `image-ref`, `severity` (default `HIGH,CRITICAL`), `ignore-unfixed` (default `true`) |
 | `reusable-release-on-tag.yml` | Release + changelog on `v*` tag push | `changelog-path` (default `CHANGELOG.md`) |
+| `reusable-python-ci.yml` | Install (uv / poetry / pip, from the lockfile), `compileall`, `pytest` when tests exist | `python-version` (default `3.12`), `working-directory`, `install-command`, `compile-command`, `test-command`, `extra-packages`, `apt-packages` |
+| `reusable-node-ci.yml` | Install (npm / pnpm / yarn, frozen lockfile), typecheck, build, test | `node-version` (default `22`), `working-directory`, `install-command`, `typecheck-command`, `build-command`, `test-command` |
+
+The two stack workflows take `auto`, `skip` or a shell command for each step. `auto` detects from
+the repo; `skip` logs that the step did not run. A step that found nothing to run says so with a
+notice rather than passing silently. `self-test.yml` runs both against `fixtures/` on every PR.
+
+### Adopting the stack CI (the estate's default)
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  python:
+    uses: salucallc/ci-shared/.github/workflows/reusable-python-ci.yml@<commit-sha>
+  secret-scan:
+    uses: salucallc/ci-shared/.github/workflows/reusable-secret-scan.yml@<commit-sha>
+```
+
+This repo is public, so private repos in both `salucallc` and `saluca-labs` can call it (a private
+reusable workflow could only be shared inside its own org).
+
+`tools/ci_inventory.py` lists every repo in both orgs with its stack, workflows, default-branch CI
+state and open dependency PRs (read-only, through `gh`).
 
 ## Example consumer workflow
 
