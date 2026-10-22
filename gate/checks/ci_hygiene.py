@@ -71,7 +71,10 @@ def api(path: str, token: str | None):
         with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310  (fixed https host)
             return resp.status, json.loads(resp.read() or b"null")
     except urllib.error.HTTPError as e:
-        return e.code, None
+        try:
+            return e.code, json.loads(e.read() or b"null")
+        except (ValueError, OSError):
+            return e.code, None
 
 
 def protection(repo: Repo, r: Result, slug: str | None, branch: str | None) -> None:
@@ -87,6 +90,12 @@ def protection(repo: Repo, r: Result, slug: str | None, branch: str | None) -> N
     branch = branch or meta.get("default_branch")
     code, b = api(f"/repos/{slug}/branches/{branch}", token)
     code2, rules = api(f"/repos/{slug}/rules/branches/{branch}", token)
+    if code == 200 and code2 == 403 and isinstance(rules, dict) and "Upgrade to GitHub Pro" in str(rules.get("message", "")) \
+            and not (b or {}).get("protected"):
+        # GitHub's own answer: a private repo on the Free plan can have neither rulesets nor protection
+        r.add(BLOCK, f"CI-6: {slug}@{branch} is private on a plan without branch protection or rulesets (GitHub: "
+              "'Upgrade to GitHub Pro or make this repository public'); it cannot require the gate", key="unprotectable")
+        return
     if code != 200 or code2 not in (200, 404):
         r.cannot(f"CI-6: branch or rules read failed ({code}, {code2})")
         return

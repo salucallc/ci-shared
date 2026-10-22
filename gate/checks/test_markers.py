@@ -56,7 +56,10 @@ def judge(rel: str, text: str):
                 yield BLOCK, ln, ("TST-2: bulk xfail (pytestmark or add_marker) forces every test in scope to "
                                   "'expected failure', so the suite cannot fail; mark each test with its own reason and issue"), "bulk"
             elif not (REASON_KW.search(seg) and (ISSUE.search(seg) or ISSUE.search(context_before(text, m.start())))):
-                yield BLOCK, ln, "TST-2: bulk skip without a reason and an issue link", "bulk"
+                missing = [w for w, ok in (("a reason", REASON_KW.search(seg)),
+                                           ("an issue link", ISSUE.search(seg) or ISSUE.search(context_before(text, m.start()))))
+                           if not ok]
+                yield BLOCK, ln, f"TST-2: bulk skip without {' and '.join(missing)}", "bulk"
             else:
                 yield WARN, ln, "TST-2: bulk skip (reason and issue present); check it is still needed", "bulk"
         for m in PY_MARKERS.finditer(view):

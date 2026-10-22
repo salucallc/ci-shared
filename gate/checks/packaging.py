@@ -25,6 +25,10 @@ CMD = re.compile(r"(?m)(?:^|[`$>\s])(?P<tool>pipx install|pip3? install|python3?
                  r"(?P<args>[^\n`|;&]*)")
 UNPUBLISHED = re.compile(r"(?i)(not (yet )?(published|released|on (pypi|npm|crates\.io))|unpublished|not available on (pypi|npm)"
                          r"|install from (source|a clone)|until (it is|it's) published)")
+PLANNED = re.compile(r"(?i)\b(planned|proposed|roadmap|future|not yet (built|shipped|available)|coming soon|mvp\+\d*|"
+                     r"when (the )?\w+ lands)\b")
+# README and llms.txt, plus user-facing docs; design notes under docs/ describe things not built yet
+USER_DOC = re.compile(r"(?i)^docs/([^/]*/)?(index|readme|install(ation|ing)?|quick-?start|getting[-_]started|usage|setup)[^/]*\.mdx?$")
 REGISTRY = {"pip": "pypi", "pip3": "pypi", "python": "pypi", "python3": "pypi", "uv": "pypi", "uvx": "pypi", "pipx": "pypi",
             "npm": "npm", "npx": "npm", "pnpm": "npm", "yarn": "npm", "bunx": "npm", "bun": "npm", "cargo": "crates"}
 FLAGS_WITH_ARG = {"-r", "--requirement", "-c", "--constraint", "-e", "--editable", "-i", "--index-url", "--extra-index-url",
@@ -35,10 +39,16 @@ SAFE_NAME = re.compile(r"^(@[a-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*$")
 
 def parse_packages(args: str) -> list[str]:
     out, skip = [], False
-    for tok in args.split():
+    toks = args.replace('"', " \" ").replace("'", " ' ").split()
+    toks = [t for t in toks if t not in ('"', "'")]
+    for i, tok in enumerate(toks):
         if skip:
             skip = False
             continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if nxt == "@" or re.match(r"^[\w.-]+@(git\+|https?:|file:)", tok):
+            skip = nxt == "@"
+            continue  # PEP 508 direct reference ("name @ git+https://..."): installs from a URL, not the registry
         if tok in FLAGS_WITH_ARG:
             skip = True
             continue
@@ -77,11 +87,12 @@ def deep_pip(name: str) -> tuple[bool, str]:
 
 def claims_in(repo: Repo) -> list[tuple[str, int, str, str, bool]]:
     """(file, line, registry, package, exempt) for every install instruction."""
-    docs = [f for f in repo.tracked() if f in ("README.md", "llms.txt") or (f.startswith("docs/") and f.endswith(".md"))]
+    docs = [f for f in repo.tracked() if f in ("README.md", "llms.txt") or USER_DOC.match(f)]
     found = []
     for rel in docs:
         text = repo.text(rel) or ""
         lines = text.splitlines()
+        heads = [i for i, l in enumerate(lines) if re.match(r"^#{1,6}\s", l)]
         # Only instructions a reader would paste: fenced code blocks and inline code spans.
         regions = [(m.start(), m.end()) for m in re.finditer(r"```[\s\S]*?```|`[^`\n]+`", text)]
         for m in CMD.finditer(text):
@@ -94,8 +105,11 @@ def claims_in(repo: Repo) -> list[tuple[str, int, str, str, bool]]:
             if not reg:
                 continue
             ln = text.count("\n", 0, m.start()) + 1
-            window = " ".join(lines[max(0, ln - 6): ln + 5])
-            exempt = bool(UNPUBLISHED.search(window))
+            # the exemption holds for the whole section the instruction sits in (heading to heading)
+            start = max([h for h in heads if h < ln] or [0])
+            end = min([h for h in heads if h >= ln] or [len(lines)])
+            section = " ".join(lines[start:end])
+            exempt = bool(UNPUBLISHED.search(section) or PLANNED.search(section))
             for pkg in parse_packages(m.group("args")):
                 found.append((rel, ln, reg, pkg, exempt))
     return found

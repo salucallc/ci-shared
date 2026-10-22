@@ -27,6 +27,9 @@ NOT_SECRET = re.compile(r"(?i)(_id|_ids|_name|_names|_path|_file|_env|_url|_len|
                         r"_prefix|_hint|_ttl|_expiry|_expires|_at|_set|_header_name|_field|_kind|_mode|_bucket|_budget)$|"
                         r"^(max_|num_|n_)?tokens?(_count|_used|_limit)?$|(^|_)tokens$|^token_?(count|usage|budget|limit|type)$|tokenizer|"
                         r"^(is|has|use|needs?|require)_")
+SECRET_RETURNING = re.compile(r"(?i)^(generate|create|issue|mint|new|make|get|read|load|fetch|decrypt|reveal|export)_?\w*"
+                              r"(key|secret|token|password|credential)s?$")
+EXAMPLE_DIR = re.compile(r"(?i)(^|/)(examples?|demos?|samples?|docs?|notebooks?)/")
 REDACT_CALL = re.compile(r"(?i)redact|mask|fingerprint|fp12|sha256|hashlib|digest|len\(|obfuscat|truncat|\[:\d+\]|\*\*\*")
 REQUEST_BASES = re.compile(r"^(request|req|incoming|self\.request|flask\.request|ctx\.request|websocket|ws|scope)$")
 OTHER_TOOL_CONFIG = re.compile(r"(?i)(\.claude|claude_desktop_config|\.cursor|\.codex|\.continue|\.windsurf|\.vscode|"
@@ -56,6 +59,40 @@ def _dotted(node: ast.AST) -> str:
         return ast.unparse(node)
     except Exception:  # noqa: BLE001
         return ""
+
+
+PASSTHROUGH = {"str", "repr", "format", "bytes", "decode", "encode", "hex", "strip", "upper", "lower", "dumps", "b64encode",
+               "urlsafe_b64encode", "join", "replace", "get", "getattr", "f"}
+
+
+def _leak(node: ast.AST) -> str:
+    """The secret-like name whose VALUE this expression prints, or ''.
+
+    A call's arguments are not printed, only its return value: print(verify_token(secret, tok))
+    prints a verdict. A call returns a secret when its name says so (generate_api_key()), or when
+    it only reformats its input (str(), repr(), .decode(), json.dumps()); then its inputs count.
+    """
+    if isinstance(node, ast.Call):
+        fname = _name_of(node.func)
+        if SECRET_RETURNING.search(fname or ""):
+            return fname
+        if fname in PASSTHROUGH:
+            for child in list(node.args) + [k.value for k in node.keywords] + (
+                    [node.func.value] if isinstance(node.func, ast.Attribute) else []):
+                got = _leak(child)
+                if got:
+                    return got
+        return ""
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        nm = _name_of(node)
+        if nm and SECRET_NAME.search(nm) and not NOT_SECRET.search(nm):
+            return nm
+        return _leak(node.value) if isinstance(node, ast.Attribute) else ""
+    for child in ast.iter_child_nodes(node):
+        got = _leak(child)
+        if got:
+            return got
+    return ""
 
 
 class PyScan(ast.NodeVisitor):
@@ -93,11 +130,7 @@ class PyScan(ast.NodeVisitor):
             for arg in list(node.args) + [k.value for k in node.keywords]:
                 if REDACT_CALL.search(_dotted(arg)):
                     continue
-                for sub in ast.walk(arg):
-                    nm = _name_of(sub) if isinstance(sub, (ast.Name, ast.Attribute)) else ""
-                    if nm and SECRET_NAME.search(nm) and not NOT_SECRET.search(nm):
-                        leaked = nm
-                        break
+                leaked = _leak(arg)
                 if leaked:
                     break
             if leaked:
@@ -244,6 +277,8 @@ def run(repo: Repo, opts) -> Result:
         hits = py_scan(rel, text) if suffix == ".py" else js_scan(text) if suffix in (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx") else []
         lines = text.splitlines()
         for sev, ln, msg in hits:
+            if msg.startswith("SEC-6") and EXAMPLE_DIR.search(rel):
+                sev, msg = WARN, msg + " (example code: people copy it, so prefer a fingerprint here too)"
             src = lines[ln - 1].strip() if 0 < ln <= len(lines) else ""
             r.add(sev, msg, rel, ln, key=f"{rel}|{msg[:40]}|{src[:80]}")
     auth_findings(repo, files, r)

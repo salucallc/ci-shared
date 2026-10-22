@@ -223,6 +223,11 @@ class Paths(Base):
     def test_generic_path_in_docs_is_warning_only(self):
         self.assertPasses(dict(CLEAN_PY, **{"docs/setup.md": "On Windows: `D:\\work\\demo`.\n"}), "paths", allow=("warn",))
 
+    def test_os_path_in_detection_rule_is_warning(self):
+        # borrowed-trust-detections Sigma rules, 2026-10-22 dry run: an OS location as detection data
+        rule = "detection:\n  selection:\n    Image|startswith: 'C:\\Windows\\System32\\'\n"
+        self.assertPasses(dict(CLEAN_PY, **{"detections/sigma/rule.yml": rule}), "paths", allow=("warn",))
+
     def test_relative_paths_pass(self):
         self.assertPasses(dict(CLEAN_PY, **{"src/io.py": 'from pathlib import Path\nDATA = Path(__file__).parent / "data"\n'
                                                          'URL = "https://example.com/a:b"\n'}), "paths", allow=("pass",))
@@ -384,6 +389,30 @@ class Packaging(Base):
         code, out, data = self.run_gate(self.readme("```sh\npip install requests\n```\n"), "--only", "packaging")
         self.assertEqual(code, 0, out)
 
+    def test_pep508_direct_reference_is_not_a_registry_claim(self):
+        # velamen README, 2026-10-22 dry run: installs from git, never from PyPI
+        code, out, data = self.run_gate(self.readme(f'```bash\npip install "{self.UNPUB} @ git+https://github.com/o/r@abc"\n'
+                                                    f'pip install "{self.UNPUB}[crypto] @ git+https://github.com/o/r@abc"\n```\n'),
+                                        "--only", "packaging")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(status_of(data, "packaging"), "n/a", out)
+
+    def test_exemption_covers_the_whole_section(self):
+        text = (f"It is not published on PyPI; install from a clone.\n\nSome more prose.\n\nAnd more.\n\nStill more.\n\n"
+                f"```sh\npip install {self.UNPUB}\n```\n\n```sh\npip install {self.UNPUB}[extra]\n```\n")
+        code, out, data = self.run_gate(self.readme(text), "--only", "packaging")
+        self.assertEqual(code, 0, out)
+
+    def test_design_notes_under_docs_are_not_install_claims(self):
+        files = dict(CLEAN_PY, **{"docs/architecture/attach.md": f"# Attach\n\n`npx {self.UNPUB}` will upload a file.\n"})
+        code, out, data = self.run_gate(files, "--only", "packaging")
+        self.assertEqual(status_of(data, "packaging"), "n/a", out)
+
+    def test_install_page_under_docs_is_checked(self):
+        files = dict(CLEAN_PY, **{"docs/installation.md": f"# Install\n\n`pip install {self.UNPUB}`\n"})
+        code, out, data = self.run_gate(files, "--only", "packaging")
+        self.assertEqual(code, 1, out)
+
     def test_offline_is_cannot_tell(self):
         code, out, data = self.run_gate(self.readme("```sh\npip install requests\n```\n"), "--only", "packaging", "--offline")
         self.assertEqual(code, 2, out)
@@ -413,6 +442,15 @@ class Licence(Base):
         readme = CLEAN_PY["README.md"].replace("MIT", "Apache-2.0")
         note = "# Changelog\n\n- 2026-10-22: licence changed from MIT to Apache-2.0 (approved by the owner).\n"
         self.assertPasses(CLEAN_PY, "licence", extra=[{"LICENSE": APACHE, "README.md": readme, "CHANGELOG.md": note}])
+
+    def test_readme_paper_doi_is_not_the_code_record(self):
+        # detection-content, 2026-10-22 dry run: the README cites the CC-BY paper; only CITATION.cff's own doi counts
+        sys.path.insert(0, str(ROOT))
+        from gate.checks import licence
+        from gate.core import Repo
+        repo = GateRepo(dict(CLEAN_PY, **{"README.md": CLEAN_PY["README.md"] + "\nPaper: https://doi.org/10.5281/zenodo.123\n"}))
+        self.addCleanup(repo.close)
+        self.assertEqual(licence.zenodo_licences(Repo(repo.path)), [])
 
     def test_consistent_passes(self):
         files = dict(CLEAN_PY, **{"package.json": json.dumps({"name": "demo", "license": "MIT"})})
@@ -445,6 +483,57 @@ class CiHygiene(Base):
 
     def test_gate_adopted_passes(self):
         self.assertPasses(dict(CLEAN_PY, **{".github/workflows/ci.yml": GOOD_CI}), "ci-hygiene")
+
+    def test_private_free_plan_repo_is_unprotectable_not_cannot_tell(self):
+        # pantheon, 2026-10-22 dry run: GitHub answers 403 "Upgrade to GitHub Pro" for rulesets on a private Free repo
+        sys.path.insert(0, str(ROOT))
+        from gate.checks import ci_hygiene
+        from gate.core import Repo, Result
+        answers = {"/repos/o/r": (200, {"default_branch": "main", "private": True}),
+                   "/repos/o/r/branches/main": (200, {"protected": False}),
+                   "/repos/o/r/rules/branches/main": (403, {"message": "Upgrade to GitHub Pro or make this repository public"})}
+        real = ci_hygiene.api
+        ci_hygiene.api = lambda path, token: answers[path]
+        self.addCleanup(setattr, ci_hygiene, "api", real)
+        repo = GateRepo(CLEAN_PY)
+        self.addCleanup(repo.close)
+        r = Result("branch-protection", "")
+        ci_hygiene.protection(Repo(repo.path), r, "o/r", None)
+        self.assertEqual(r.status, "fail")
+        self.assertTrue(any("cannot require the gate" in f.message for f in r.findings))
+
+    def test_unprotected_public_repo_fails(self):
+        sys.path.insert(0, str(ROOT))
+        from gate.checks import ci_hygiene
+        from gate.core import Repo, Result
+        answers = {"/repos/o/r": (200, {"default_branch": "main", "private": False}),
+                   "/repos/o/r/branches/main": (200, {"protected": False, "protection": {"enabled": False}}),
+                   "/repos/o/r/rules/branches/main": (200, [])}
+        real = ci_hygiene.api
+        ci_hygiene.api = lambda path, token: answers[path]
+        self.addCleanup(setattr, ci_hygiene, "api", real)
+        repo = GateRepo(CLEAN_PY)
+        self.addCleanup(repo.close)
+        r = Result("branch-protection", "")
+        ci_hygiene.protection(Repo(repo.path), r, "o/r", None)
+        self.assertTrue(any("is not protected" in f.message for f in r.findings))
+
+    def test_protected_with_gate_required_passes(self):
+        sys.path.insert(0, str(ROOT))
+        from gate.checks import ci_hygiene
+        from gate.core import Repo, Result
+        answers = {"/repos/o/r": (200, {"default_branch": "main", "private": False}),
+                   "/repos/o/r/branches/main": (200, {"protected": True, "protection": {
+                       "enabled": True, "required_status_checks": {"contexts": ["gate / Merge gate all"]}}}),
+                   "/repos/o/r/rules/branches/main": (200, [{"type": "pull_request"}])}
+        real = ci_hygiene.api
+        ci_hygiene.api = lambda path, token: answers[path]
+        self.addCleanup(setattr, ci_hygiene, "api", real)
+        repo = GateRepo(CLEAN_PY)
+        self.addCleanup(repo.close)
+        r = Result("branch-protection", "")
+        ci_hygiene.protection(Repo(repo.path), r, "o/r", None)
+        self.assertEqual(r.status, "pass", [f.message for f in r.findings])
 
 
 class Deps(Base):
@@ -484,6 +573,20 @@ class Security(Base):
         code = ("import hashlib, logging\nlog = logging.getLogger(__name__)\n\n\ndef issue(api_key):\n"
                 "    log.info('issued %s', hashlib.sha256(api_key.encode()).hexdigest()[:12])\n")
         self.assertPasses(dict(CLEAN_PY, **{"src/keys.py": code}), "security", allow=("pass",))
+
+    def test_printing_a_verify_result_passes(self):
+        # soulguard examples/quickstart.py, 2026-10-22 dry run: the verdict of verify_token, not a token
+        code = ("from soul import issue_token, verify_token\n\n\ndef main(secret_bytes, tok):\n"
+                "    ok = verify_token(secret_bytes, tok, 'memory:read')\n    print('grants ->', verify_token(secret_bytes, tok, 'x'))\n")
+        self.assertPasses(dict(CLEAN_PY, **{"src/demo.py": code}), "security", allow=("pass",))
+
+    def test_printing_a_generated_key_fails(self):
+        code = "from keys import generate_api_key\n\n\ndef main():\n    print('key:', generate_api_key())\n"
+        self.assertFails(dict(CLEAN_PY, **{"src/demo.py": code}), "security", "SEC-6")
+
+    def test_secret_printed_in_examples_is_warning(self):
+        code = "def main(secret):\n    print('recovered', secret)\n"
+        self.assertPasses(dict(CLEAN_PY, **{"examples/basic.py": code}), "security", allow=("warn",))
 
     def test_auth_default_off_fails(self):
         code = "import os\nAUTH_ENABLED = os.getenv('AUTH_ENABLED', 'false') == 'true'\n"

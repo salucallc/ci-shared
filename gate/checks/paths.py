@@ -24,6 +24,8 @@ from ..core import BLOCK, WARN, Repo, Result, kind_of
 DRIVE = re.compile(r"(?<![A-Za-z0-9_%$])([A-Za-z]):(\\\\|\\|/)(?=[A-Za-z0-9_.$~ -])")
 WIN_HOME = re.compile(r"(?i)(?<![A-Za-z0-9_])[a-z]:(?:\\\\|\\|/)users(?:\\\\|\\|/)([A-Za-z][\w.-]*)")
 UNIX_HOME = re.compile(r"(?<![\w.~$-])/(Users|home)/([A-Za-z_][\w.-]*)")
+OS_PATH = re.compile(r"(?i)[a-z]:(\\\\|\\|/)+(windows|program files( \(x86\))?|programdata|system volume information|"
+                     r"\$recycle\.bin|users(\\\\|\\|/)+(public|default|all users))\b")
 WSL = re.compile(r"(?<![\w.-])/mnt/[a-z]/")
 TAILNET = re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.ts\.net\b")
 PLACEHOLDER_USERS = {"user", "username", "you", "your-name", "yourname", "yourusername", "me", "name", "someone",
@@ -92,6 +94,10 @@ def scan_text(rel: str, text: str, extra: list[re.Pattern] | None = None):
             if "://" in line[m.start():m.start() + 4]:
                 continue
             tok = line[m.start():m.start() + 24]
+            if OS_PATH.match(line[m.start():]):
+                # C:\Windows\System32, C:\Program Files: an OS location (detection rules, docs), nobody's machine
+                yield WARN, n, f"TST-3: well-known OS path {tok.strip()!r} (fine as data; never as a place to read or write)", tok
+                continue
             yield (BLOCK if strict else WARN), n, f"TST-3: hardcoded Windows path {tok.strip()!r}", tok
         for m in WSL.finditer(line):
             yield BLOCK, n, f"EXP-1: WSL drive path {m.group(0)!r}", m.group(0)

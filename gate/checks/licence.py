@@ -184,10 +184,11 @@ def declared(repo: Repo) -> list[tuple[str, str]]:
 
 
 def zenodo_licences(repo: Repo) -> list[tuple[str, str]]:
+    # Only the code's OWN record: CITATION.cff's top-level doi. A README often cites the paper the code
+    # reproduces, whose record carries the paper's licence (CC-BY), not the code's.
     dois = set()
-    for f in ("CITATION.cff", ".zenodo.json", "README.md"):
-        if repo.exists(f):
-            dois |= set(re.findall(r"10\.5281/zenodo\.(\d+)", repo.text(f) or ""))
+    if repo.exists("CITATION.cff"):
+        dois |= set(re.findall(r"(?m)^doi:\s*['\"]?10\.5281/zenodo\.(\d+)", repo.text("CITATION.cff") or ""))
     out = []
     for recid in sorted(dois):
         url = f"https://zenodo.org/api/records/{recid}"
@@ -195,7 +196,7 @@ def zenodo_licences(repo: Repo) -> list[tuple[str, str]]:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=20) as resp:  # nosec B310  (fixed https host)
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            out.append((f"zenodo {recid}", f"error: HTTP {e.code}"))
+            out.append((f"zenodo {recid}", f"gone: HTTP {e.code}" if e.code in (404, 410) else f"error: HTTP {e.code}"))
             continue
         except OSError as e:
             out.append((f"zenodo {recid}", f"error: {e}"))
@@ -251,7 +252,10 @@ def run(repo: Repo, opts) -> Result:
         for where, val in z:
             if val.startswith("error:"):
                 r.cannot(f"{where}: {val}")
-        decl += [d for d in z if not d[1].startswith("error:")]
+            elif val.startswith("gone:"):
+                r.add(WARN, f"LIC-2: CITATION.cff cites {where}, which no longer resolves ({val[6:]}); cite the concept DOI",
+                      "CITATION.cff", key=f"gone|{where}")
+        decl += [d for d in z if not d[1].startswith(("error:", "gone:"))]
     for where, val in decl:
         if val.startswith("unrecognised"):
             r.add(BLOCK, f"LIC-2: {where} states a licence the gate cannot map to SPDX ({val[14:]}); use an SPDX id",
