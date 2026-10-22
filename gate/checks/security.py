@@ -85,7 +85,7 @@ def _leak(node: ast.AST) -> str:
         return ""
     if isinstance(node, (ast.Name, ast.Attribute)):
         nm = _name_of(node)
-        if nm and SECRET_NAME.search(nm) and not NOT_SECRET.search(nm):
+        if nm and SECRET_NAME.search(nm) and not benign(nm):
             return nm
         return _leak(node.value) if isinstance(node, ast.Attribute) else ""
     for child in ast.iter_child_nodes(node):
@@ -152,15 +152,36 @@ JS_HEADERS = re.compile(r"headers\s*:\s*(\{\s*\.\.\.\s*)?(req|request|ctx\.reque
 JS_LOG = re.compile(r"console\.(log|info|warn|error|debug)\s*\(([^)]*)\)")
 
 
+BENIGN_PARTS = {"id", "ids", "name", "names", "path", "paths", "file", "files", "dir", "url", "urls", "env", "len", "length",
+                "count", "counts", "type", "types", "limit", "limits", "usage", "prefix", "hint", "ttl", "expiry", "expires",
+                "at", "kind", "mode", "hash", "hashed", "digest", "fingerprint", "fp", "label", "scope", "scopes", "field",
+                "today", "total", "issued", "used", "remaining", "left", "budget", "spent", "rate", "policy", "rotation",
+                "status", "valid", "invalid", "missing", "required", "header", "length", "version", "algorithm", "alg"}
+
+
+def benign(name: str) -> bool:
+    """A secret-like word inside a name that holds something else: soulkey_id_str, tokens_today."""
+    if NOT_SECRET.search(name):
+        return True
+    parts = [p for p in name.lower().split("_") if p]
+    return any(p in BENIGN_PARTS for p in parts[1:]) or (parts[:1] and parts[0] in ("is", "has", "use", "needs", "require", "n", "num", "max", "min"))
+
+
+def js_code_only(args: str) -> str:
+    """Console arguments with string text removed; template ${...} expressions are kept."""
+    args = re.sub(r"`((?:\\.|[^`\\])*)`", lambda m: " ".join(re.findall(r"\$\{([^}]*)\}", m.group(1))), args)
+    return re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", " ", args)
+
+
 def js_scan(text: str):
     hits = []
     for m in JS_HEADERS.finditer(text):
         hits.append((BLOCK, text.count("\n", 0, m.start()) + 1,
                      "SEC-5: forwards the incoming request's headers upstream; forward an explicit allowlist"))
     for m in JS_LOG.finditer(text):
-        for tok in re.findall(r"[A-Za-z_$][\w$]*", m.group(2)):
+        for tok in re.findall(r"[A-Za-z_$][\w$]*", js_code_only(m.group(2))):
             snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", tok).lower()
-            if SECRET_NAME.search(snake) and not NOT_SECRET.search(snake) and not REDACT_CALL.search(m.group(2)):
+            if SECRET_NAME.search(snake) and not benign(snake) and not REDACT_CALL.search(m.group(2)):
                 hits.append((BLOCK, text.count("\n", 0, m.start()) + 1, f"SEC-6: {tok!r} is logged to the console"))
                 break
     return hits

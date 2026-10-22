@@ -45,6 +45,8 @@ SIGNATURES = [  # order matters: the more specific text first
     ("ISC", [r"Permission to use, copy, modify, and(/or)? distribute this software for any purpose with or without fee"]),
     ("BSD-3-Clause", [r"Redistribution and use in source and binary forms", r"(Neither the name|names of its\s+contributors)"]),
     ("BSD-2-Clause", [r"Redistribution and use in source and binary forms"]),
+    ("FSL-1.1-ALv2", [r"Functional Source License,? Version 1\.1", r"Apache (License,? Version )?2\.0 Future License"]),
+    ("FSL-1.1-MIT", [r"Functional Source License,? Version 1\.1", r"MIT Future License"]),
     ("MIT", [r"Permission is hereby granted, free of charge"]),
 ]
 ALIASES = {
@@ -61,10 +63,24 @@ ALIASES = {
     "cc0": "CC0-1.0", "unlicense": "Unlicense", "isc": "ISC", "busl-1.1": "BUSL-1.1", "elastic-2.0": "Elastic-2.0",
     "polyform-noncommercial-1.0.0": "PolyForm-Noncommercial-1.0.0", "polyform noncommercial": "PolyForm-Noncommercial-1.0.0",
     "polyform-small-business-1.0.0": "PolyForm-Small-Business-1.0.0", "polyform-shield-1.0.0": "PolyForm-Shield-1.0.0",
+    "fsl-1.1-alv2": "FSL-1.1-ALv2", "fsl-1.1-apache-2.0": "FSL-1.1-ALv2", "licenseref-fsl-1.1-apache-2.0": "FSL-1.1-ALv2",
+    "functional source license, version 1.1, apache 2.0 future license": "FSL-1.1-ALv2", "fsl-1.1-mit": "FSL-1.1-MIT",
+    "licenseref-fsl-1.1-mit": "FSL-1.1-MIT",
 }
 MENTION = re.compile(r"(?i)\b(MIT|Apache[- ]?(License,? )?(Version )?2(\.0)?|BSD[- ][23][- ]Clause|A?GPL-?v?[23](\.0)?(-only|-or-later)?|"
                      r"LGPL-?v?[23](\.[01])?|MPL-?2\.0|CC[- ]BY(-NC)?(-SA)?[- ]4\.0|CC0(-1\.0)?|Unlicense|ISC|BUSL-1\.1|"
-                     r"Elastic-2\.0|PolyForm[- ](Noncommercial|Small[- ]Business|Shield)(-1\.0\.0)?)\b")
+                     r"Elastic-2\.0|PolyForm[- ](Noncommercial|Small[- ]Business|Shield)(-1\.0\.0)?|"
+                     r"FSL-1\.1-(ALv2|MIT|Apache-2\.0))\b")
+
+
+def mentioned(text: str) -> set[str]:
+    """SPDX ids a prose section names. An FSL licence names its future licence (Apache 2.0 or MIT)
+    in the same breath; that is part of FSL, not a second licence."""
+    ids = {canon(m.group(0)) for m in MENTION.finditer(text)} - {None}
+    if re.search(r"(?i)functional source license|\bFSL-1\.1", text):
+        ids.add("FSL-1.1-MIT" if re.search(r"(?i)MIT Future License|FSL-1\.1-MIT", text) else "FSL-1.1-ALv2")
+        ids -= {"Apache-2.0", "MIT"}
+    return ids
 CLASSIFIER = re.compile(r"License :: (?:OSI Approved :: )?([^\"'\n]+)")
 
 
@@ -172,12 +188,12 @@ def declared(repo: Repo) -> list[tuple[str, str]]:
             out.append((".zenodo.json", "unrecognised: unparseable"))
     if repo.exists("README.md"):
         sec = readme_licence_section(repo.text("README.md") or "")
-        ids = {canon(m.group(0)) for m in MENTION.finditer(sec)} - {None}
+        ids = mentioned(sec)
         for i in sorted(ids):
             out.append(("README.md License section", i))
     if repo.exists("NOTICE") or repo.exists("NOTICE.md"):
         name = "NOTICE" if repo.exists("NOTICE") else "NOTICE.md"
-        ids = {canon(m.group(0)) for m in MENTION.finditer(repo.text(name) or "")} - {None}
+        ids = mentioned(repo.text(name) or "")
         for i in sorted(ids):
             out.append((name, i))
     return out

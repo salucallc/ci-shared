@@ -39,6 +39,9 @@ SECRET_FILE_NAMES = re.compile(
 ENV_TEMPLATE = re.compile(r"(?i)\.(example|sample|template|dist|defaults?|tmpl)$|(^|/)example\.env$")
 SECRETISH_KEY = re.compile(r"(?i)(pass(word|wd)?|secret|token|api[_-]?key|private[_-]?key|dsn|database_url|"
                            r"conn(ection)?[_-]?str(ing)?|credential|license[_-]?key|signing[_-]?key|webhook)")
+# SOULAUTH_JWT_PRIVATE_KEY_PATH=./keys/private.pem names where a secret lives, not the secret
+NOT_A_VALUE_KEY = re.compile(r"(?i)_(path|file|dir|filename|name|id|url_?base|algorithm|alg|issuer|audience|ttl|expires?|"
+                             r"expiry|length|len|header|prefix|enabled|required|mode|type|version)$")
 K8S_KIND = re.compile(r"(?m)^kind:\s*Secret\s*$")
 PEM_PRIVATE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 
@@ -159,7 +162,7 @@ def judge_text(path: str, text: str, where: str):
     if ENV_TEMPLATE.search(path) or name.startswith(".env"):
         for n, line in enumerate(text.splitlines(), 1):
             m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", line)
-            if not m or not SECRETISH_KEY.search(m.group(1)):
+            if not m or not SECRETISH_KEY.search(m.group(1)) or NOT_A_VALUE_KEY.search(m.group(1)):
                 continue
             val = m.group(2).split(" #")[0].strip().strip("'\"")
             if len(val) < 8 or is_placeholder(val) or val.startswith(("$", "<", "{")) or "${" in val:

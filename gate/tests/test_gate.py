@@ -163,6 +163,11 @@ class Secrets(Base):
         self.assertPasses(dict(CLEAN_PY, **{".env.example": "DATABASE_URL=postgresql://app:${DB_PASSWORD}@db:5432/app\n"
                                                              "API_KEY=your-api-key\n"}), "secrets", env=self.env)
 
+    def test_env_template_key_path_passes(self):
+        # pantheon apps/platform-api/.env.example, 2026-10-22 dry run: a path to a key, not a key
+        self.assertPasses(dict(CLEAN_PY, **{".env.example": "SOULAUTH_JWT_PRIVATE_KEY_PATH=./keys/private.pem\n"}), "secrets",
+                          env=self.env)
+
     def test_committed_env_file_fails(self):
         self.assertFails(dict(CLEAN_PY, **{".env": "DEBUG=1\n"}), "secrets", "secrets file committed", env=self.env)
 
@@ -452,6 +457,15 @@ class Licence(Base):
         self.addCleanup(repo.close)
         self.assertEqual(licence.zenodo_licences(Repo(repo.path)), [])
 
+    def test_fsl_licence_is_recognised_everywhere(self):
+        # elysium and tiresias-core, 2026-10-22 dry run
+        fsl = "# Functional Source License, Version 1.1, Apache 2.0 Future License\n\n## Abbreviation\n\nFSL-1.1-ALv2\n"
+        readme = CLEAN_PY["README.md"].replace("MIT, see LICENSE.", "FSL-1.1-ALv2 (Functional Source License), which becomes Apache 2.0 after two years.")
+        files = dict(CLEAN_PY, **{"LICENSE": fsl, "README.md": readme,
+                                  "package.json": json.dumps({"name": "demo", "license": "FSL-1.1-ALv2"}),
+                                  "pyproject.toml": '[project]\nname = "demo"\nlicense = "LicenseRef-FSL-1.1-Apache-2.0"\n'})
+        self.assertPasses(files, "licence", allow=("pass",))
+
     def test_consistent_passes(self):
         files = dict(CLEAN_PY, **{"package.json": json.dumps({"name": "demo", "license": "MIT"})})
         self.assertPasses(files, "licence", allow=("pass",))
@@ -587,6 +601,20 @@ class Security(Base):
     def test_secret_printed_in_examples_is_warning(self):
         code = "def main(secret):\n    print('recovered', secret)\n"
         self.assertPasses(dict(CLEAN_PY, **{"examples/basic.py": code}), "security", allow=("warn",))
+
+    def test_secret_word_inside_an_id_or_counter_passes(self):
+        # pantheon playbooks.py and cli.py, 2026-10-22 dry run
+        code = ("import logging, click\nlogger = logging.getLogger(__name__)\n\n\ndef f(soulkey_id_str, tokens_today):\n"
+                "    logger.info('quarantine.off', soulkey_id=soulkey_id_str)\n    click.echo(f'{tokens_today} issued')\n")
+        self.assertPasses(dict(CLEAN_PY, **{"src/p.py": code}), "security", allow=("pass",))
+
+    def test_secret_word_inside_a_js_string_passes(self):
+        code = "export function f(err) {\n  console.error('[forgot-password] error:', err);\n}\n"
+        self.assertPasses(dict(CLEAN_PY, **{"web/route.ts": code}), "security", allow=("pass",))
+
+    def test_js_template_literal_secret_fails(self):
+        code = "export function f(apiKey) {\n  console.log(`issued ${apiKey}`);\n}\n"
+        self.assertFails(dict(CLEAN_PY, **{"web/keys.ts": code}), "security", "SEC-6")
 
     def test_auth_default_off_fails(self):
         code = "import os\nAUTH_ENABLED = os.getenv('AUTH_ENABLED', 'false') == 'true'\n"

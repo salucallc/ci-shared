@@ -198,7 +198,8 @@ def run_checks(repo: Repo, names: list[str], a) -> list[Result]:
     return results
 
 
-def render(repo: Repo, results: list[Result], out=sys.stdout, max_items: int = 40) -> None:
+def render(repo: Repo, results: list[Result], out=None, max_items: int = 40) -> None:
+    out = out or sys.stdout  # resolved per call, so contextlib.redirect_stdout (gate_matrix.py) captures it
     print(f"saluca merge gate: {repo.root.name}  ({dt.date.today().isoformat()})", file=out)
     print(f"{'check':<19}{'status':<13}{'block':>6}{'warn':>6}{'waived':>8}{'debt':>6}", file=out)
     for r in results:
