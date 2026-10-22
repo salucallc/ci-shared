@@ -734,6 +734,20 @@ class GateConfig(Base):
         self.assertEqual(code, 1, out)
         self.assertIn("unknown .gate.toml section", out)
 
+    def test_baseline_file_does_not_republish_findings(self):
+        # adoption PRs commit the baseline to public repos; it must not quote a path or host it found
+        home = "/Users/" + "mkowalski"
+        repo = GateRepo(dict(CLEAN_PY, **{"src/io.py": f'P = "{home}/data"\n'}))
+        self.addCleanup(repo.close)
+        subprocess.run([sys.executable, "-m", "gate", "baseline", "--repo", str(repo.path), "--only", "paths", "--offline"],
+                       cwd=ROOT, check=True, capture_output=True)
+        text = (repo.path / ".gate-baseline.json").read_text(encoding="utf-8")
+        self.assertNotIn("mkowalski", text)
+        self.assertEqual(len(json.loads(text)["entries"]), 1)
+        repo.commit("baseline")
+        code, out, _ = repo.gate("--only", "paths", "--offline")
+        self.assertEqual(code, 0, out)
+
     def test_baseline_absorbs_debt_and_may_only_shrink(self):
         files = dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\n'})
         repo = GateRepo(files)

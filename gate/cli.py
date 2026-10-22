@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -124,6 +125,17 @@ def apply_waivers(results: list[Result], ws: list[dict]) -> None:
                 break
 
 
+def fid(f) -> str:
+    """A finding's baseline id: a hash, so the file never republishes what was found (a path, a host)."""
+    return hashlib.sha256(f"{f.check}|{f.ident()}".encode("utf-8")).hexdigest()[:20]
+
+
+def entry_id(e: dict) -> str:
+    if "id" in e:
+        return e["id"]
+    return hashlib.sha256(f"{e['check']}|{e['key']}".encode("utf-8")).hexdigest()[:20]  # version 1 files
+
+
 def baseline_path(repo: Repo) -> Path:
     return repo.root / ".gate-baseline.json"
 
@@ -134,14 +146,14 @@ def apply_baseline(repo: Repo, results: list[Result], cfg_result: Result, base_r
         return
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        entries = {(e["check"], e["key"]) for e in data.get("entries", [])}
+        entries = {(e["check"], entry_id(e)) for e in data.get("entries", [])}
     except (json.JSONDecodeError, KeyError, TypeError):
         cfg_result.cannot(".gate-baseline.json is not valid")
         return
     if base_ref:
         try:
             old = json.loads(repo.git("show", f"{base_ref}:.gate-baseline.json"))
-            old_entries = {(e["check"], e["key"]) for e in old.get("entries", [])}
+            old_entries = {(e["check"], entry_id(e)) for e in old.get("entries", [])}
             grown = entries - old_entries
             if grown:
                 cfg_result.add(BLOCK, f"GATE-3: the baseline grew by {len(grown)} entr{'y' if len(grown) == 1 else 'ies'} "
@@ -156,9 +168,9 @@ def apply_baseline(repo: Repo, results: list[Result], cfg_result: Result, base_r
         if r.check in NO_BASELINE:
             continue
         for f in r.findings:
-            if f.severity == BLOCK and f.state == "open" and (r.check, f.ident()) in entries:
+            if f.severity == BLOCK and f.state == "open" and (r.check, fid(f)) in entries:
                 f.state, f.note = "baselined", "pre-existing debt recorded in .gate-baseline.json"
-                used.add((r.check, f.ident()))
+                used.add((r.check, fid(f)))
     stale = entries - used
     if stale:
         cfg_result.add(WARN, f"GATE-3: {len(stale)} baseline entr{'y is' if len(stale) == 1 else 'ies are'} fixed; "
@@ -327,11 +339,12 @@ def main(argv: list[str] | None = None) -> int:
         a.visibility = visibility(repo, a)
     results = run_checks(repo, names, a)
     if a.command == "baseline":
-        entries = [{"check": r.check, "key": f.ident(), "path": f.path, "message": f.message[:200]}
+        entries = [{"check": r.check, "id": fid(f), "path": f.path}
                    for r in results if r.check not in NO_BASELINE for f in r.findings
                    if f.severity == BLOCK and f.state == "open"]
-        baseline_path(repo).write_text(json.dumps({"version": 1, "written": today.isoformat(),
+        baseline_path(repo).write_text(json.dumps({"version": 2, "written": today.isoformat(),
                                                    "rule": "debt may only shrink; see repo-merge-gate.md GATE-3",
+                                                   "note": "ids are hashes of each finding; run `python -m gate run` to see them",
                                                    "entries": entries}, indent=1) + "\n", encoding="utf-8", newline="\n")
         print(f"wrote {baseline_path(repo)} with {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}")
         return 0
