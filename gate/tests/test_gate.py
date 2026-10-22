@@ -211,6 +211,16 @@ class Paths(Base):
         self.assertFails(dict(CLEAN_PY, **{"docs/setup.md": f"Logs land in {home}/Library/demo.\n"}), "paths",
                          "a real user's home folder")
 
+    def test_internal_host_in_private_docs_is_warning(self):
+        host = "nas" + ".tail1234" + ".ts" + ".net"
+        files = dict(CLEAN_PY, **{"docs/runbook.md": f"Mount from {host}.\n"})
+        self.assertFails(files, "paths", "tailnet host", "--visibility", "public")
+        self.assertPasses(files, "paths", "--visibility", "private", allow=("warn",))
+
+    def test_internal_host_in_private_code_still_fails(self):
+        host = "nas" + ".tail1234" + ".ts" + ".net"
+        self.assertFails(dict(CLEAN_PY, **{"src/io.py": f'URL = "http://{host}"\n'}), "paths", "tailnet host", "--visibility", "private")
+
     def test_placeholder_home_in_docs_passes(self):
         self.assertPasses(dict(CLEAN_PY, **{"docs/setup.md": "Logs land in /home/user/.demo.\n"}), "paths", allow=("pass",))
 

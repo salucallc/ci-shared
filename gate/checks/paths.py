@@ -109,11 +109,16 @@ def run(repo: Repo, opts) -> Result:
     extra = extra_patterns()
     if extra:
         r.notes.append(f"{len(extra)} extra internal-path pattern(s) from GATE_EXTRA_PATH_PATTERNS")
+    private = getattr(opts, "visibility", None) == "private"
+    if private:
+        r.notes.append("private repo: EXP-1 (exposure) in prose is a warning; hardcoded paths in code still block")
     for rel in files:
         text = repo.text(rel)
         if text is None:
             continue
         for sev, n, msg, tok in scan_text(rel, text, extra):
+            if private and msg.startswith("EXP-1") and kind_of(rel) != "code":
+                sev = WARN  # an internal path in a private KB or runbook is not an exposure
             r.add(sev, msg + " (use a path relative to the file, an env var or a config value)", rel, n,
                   key=f"{rel}|{tok.strip()}")
     return r

@@ -323,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
         if a.skip_settings and "branch-protection" in names:
             names.remove("branch-protection")
-    if "docs" in names:
+    if "docs" in names or "paths" in names:
         a.visibility = visibility(repo, a)
     results = run_checks(repo, names, a)
     if a.command == "baseline":
