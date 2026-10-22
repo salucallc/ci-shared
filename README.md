@@ -2,6 +2,36 @@
 
 Reusable GitHub Actions workflows for [salucallc](https://github.com/salucallc) repositories. Derived from the `salucallc/gmail-mcp` CI template (Python + Docker security baseline) and generalized so multiple repos can adopt the same gates with a one-line `uses:` reference.
 
+## How it works
+
+How a consumer repo calls these workflows, traced from the workflow files, `tools/write_caller.py` and the caller examples in this README. Every arrow from a consumer is a `uses: salucallc/ci-shared/.github/workflows/<file>@<full commit sha>` line; the labels on the `ci.yml` arrows are the `write_caller.py` flags that add each job. No reusable workflow calls another reusable workflow: every `uses:` inside them is a third-party action pinned to a commit SHA.
+
+```mermaid
+flowchart LR
+  wc["tools/write_caller.py"] -- "writes" --> ci
+  subgraph consumers["consumer repo"]
+    ci["ci.yml from write_caller.py"]
+    ex["ci.yml, Python + Docker example"]
+    docs["docs.yml"]
+    tag["workflow on a v* tag push"]
+  end
+  subgraph callable["ci-shared workflows"]
+    py["reusable-python-ci.yml"]
+    node["reusable-node-ci.yml"]
+    ss["reusable-secret-scan.yml"]
+    sec["reusable-lint-dockerfile.yml<br/>reusable-dep-scan-python.yml<br/>reusable-sast-python.yml<br/>reusable-semgrep.yml<br/>reusable-build-smoke-docker.yml<br/>reusable-image-cve-scan.yml"]
+    rd["repo-docs.yml"]
+    rel["reusable-release-on-tag.yml"]
+  end
+  ci -- "--python" --> py
+  ci -- "--node" --> node
+  ci -- "unless --no-secret-scan" --> ss
+  ex --> sec
+  ex --> ss
+  docs --> rd
+  tag --> rel
+```
+
 ## Status
 
 Maintained. Ten reusable workflows (`reusable-*.yml`) plus `repo-docs.yml`, all invoked with `workflow_call`. `self-validate.yml` runs actionlint and yamllint over `.github/` on every PR, and `self-test.yml` runs the Python and Node stack workflows against `fixtures/` and `repo-docs.yml` against this repo. The other workflows are exercised by the repos that call them, not by this repo's CI.
@@ -13,6 +43,7 @@ Maintained. Ten reusable workflows (`reusable-*.yml`) plus `repo-docs.yml`, all 
 - This README listed `image-tag` as an input of `reusable-build-smoke-docker.yml`. The input is `image-name`.
 - This README listed `image-ref` as an input of `reusable-image-cve-scan.yml`. That workflow has no `image-ref` input: it takes `context`, `dockerfile` and `image-name` and rebuilds the image itself before scanning.
 - This README said Dependabot is configured for the `github-actions` and `pip` ecosystems. `.github/dependabot.yml` configures `github-actions` only; pinned pip tools are bumped by hand (see Pinning policy).
+- This README said every callable workflow grants `contents: read` per job. `reusable-release-on-tag.yml` grants `contents: write`, which creating a release needs; the Architecture list now says so.
 - The example consumer workflow below had a `ci-all` fan-in job with `needs:` and no `if: always()`. When a needed job fails, such a job is skipped, and GitHub reports a skipped job as passing a required check, so a failing PR could merge. The example now uses the same fan-in pattern as `self-validate.yml`.
 
 ## Install
@@ -187,15 +218,19 @@ Make `ci-all` the single required status check in branch protection; adding or r
 
 ## Architecture
 
+The consumer call graph is under [How it works](#how-it-works). This repo's own CI, traced from `self-test.yml` and `self-validate.yml` (solid arrows are local `uses: ./.github/workflows/...` calls; the dotted arrow is linting only, no call):
+
 ```mermaid
 flowchart LR
-  caller["consumer repo<br/>.github/workflows/ci.yml or docs.yml"] -- "uses: ...@sha" --> rw["ci-shared<br/>.github/workflows/reusable-*.yml, repo-docs.yml"]
-  sv["self-validate.yml<br/>actionlint + yamllint"] --> rw
-  st["self-test.yml<br/>fixtures/ + this repo"] --> rw
-  db["dependabot.yml<br/>github-actions, weekly"] --> rw
+  st["self-test.yml"] -- "fixtures/python-min" --> py["reusable-python-ci.yml"]
+  st -- "fixtures/node-min" --> node["reusable-node-ci.yml"]
+  st -- "this repo" --> rd["repo-docs.yml"]
+  sv["self-validate.yml<br/>actionlint + yamllint"] -. "lints" .-> wf[".github/ (workflows, dependabot.yml)"]
 ```
 
-- `.github/workflows/reusable-*.yml`, `repo-docs.yml`: the callable workflows. Each sets `permissions: {}` at the top and grants `contents: read` per job.
+The files:
+
+- `.github/workflows/reusable-*.yml`, `repo-docs.yml`: the callable workflows. Each sets `permissions: {}` at the top and grants per job only what that job uses: `contents: read`, except `reusable-release-on-tag.yml`, which grants `contents: write` to create the release.
 - `.github/workflows/self-validate.yml`: actionlint 1.7.12 (checksum-verified) and yamllint 1.35.1 with `.yamllint.yml`, plus a `ci-all` fan-in.
 - `.github/workflows/self-test.yml`: calls the Python and Node workflows on `fixtures/python-min` and `fixtures/node-min`, and `repo-docs.yml` on this repo, by local path.
 - `tools/`: `write_caller.py` and `ci_inventory.py`.

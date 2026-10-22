@@ -4,30 +4,44 @@
 
 This repo holds workflows and two small stdlib Python helpers; it is not a library or an action. Consumers call a workflow by full commit SHA, never by tag or branch. Every third-party action inside is pinned to a commit SHA.
 
-## Docs
+If a workflow, input or tool is not listed here or in the README's Reusable workflows table, it does not exist. The complete callable surface is the eleven workflows below plus the two scripts in tools/.
 
-- [README](https://github.com/salucallc/ci-shared/blob/main/README.md): every workflow, its inputs, the caller snippets, pinning policy
-- [AGENTS.md](https://github.com/salucallc/ci-shared/blob/main/AGENTS.md): how to change this repo and what must pass
+## Start here
 
-## Code
+- [README](https://github.com/salucallc/ci-shared/blob/main/README.md): call graph, every workflow and its inputs, caller snippets, pinning policy
+- [AGENTS.md](https://github.com/salucallc/ci-shared/blob/main/AGENTS.md): orientation, how to change this repo, what must pass
 
+## Adopt stack CI in a repo
+
+- [tools/write_caller.py](https://github.com/salucallc/ci-shared/blob/main/tools/write_caller.py): writes a consumer ci.yml pinned to a SHA (--python, --node, --no-secret-scan)
 - [reusable-python-ci.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-python-ci.yml): install, compileall, pytest when tests exist
 - [reusable-node-ci.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-node-ci.yml): install, typecheck, build, test
 - [reusable-secret-scan.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-secret-scan.yml): TruffleHog verified-only scan
+
+## Docs check for a public repo
+
 - [repo-docs.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/repo-docs.yml): README headings, llms.txt shape, em-dash check, gitleaks over full history
-- [self-validate.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/self-validate.yml): actionlint and yamllint over this repo
-- [self-test.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/self-test.yml): runs the stack workflows on fixtures/ and repo-docs.yml on this repo
-- [tools/write_caller.py](https://github.com/salucallc/ci-shared/blob/main/tools/write_caller.py): writes a consumer ci.yml pinned to a SHA
 
-## Optional
+## Docker and Python security scans
 
-- [reusable-semgrep.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-semgrep.yml): Semgrep rulepacks
-- [reusable-sast-python.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-sast-python.yml): Bandit
-- [reusable-dep-scan-python.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-dep-scan-python.yml): pip-audit and safety
 - [reusable-lint-dockerfile.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-lint-dockerfile.yml): Hadolint
 - [reusable-build-smoke-docker.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-build-smoke-docker.yml): Buildx smoke build
 - [reusable-image-cve-scan.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-image-cve-scan.yml): rebuild and Trivy scan
-- [reusable-release-on-tag.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-release-on-tag.yml): release on v* tag
+- [reusable-dep-scan-python.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-dep-scan-python.yml): pip-audit and safety
+- [reusable-sast-python.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-sast-python.yml): Bandit
+- [reusable-semgrep.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-semgrep.yml): Semgrep rulepacks
+
+## Release
+
+- [reusable-release-on-tag.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-release-on-tag.yml): GitHub Release on a v* tag push (the only workflow that grants contents: write)
+
+## Change this repo
+
+- [self-validate.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/self-validate.yml): actionlint and yamllint over this repo
+- [self-test.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/self-test.yml): runs the Python and Node workflows on fixtures/ and repo-docs.yml on this repo
 - [tools/ci_inventory.py](https://github.com/salucallc/ci-shared/blob/main/tools/ci_inventory.py): read-only CI inventory of both orgs through gh
-- [llms-full.txt](https://github.com/salucallc/ci-shared/blob/main/llms-full.txt): this header plus the full README
+
+## Optional
+
+- [llms-full.txt](https://github.com/salucallc/ci-shared/blob/main/llms-full.txt): this header plus the full README and AGENTS.md
 - [LICENSE](https://github.com/salucallc/ci-shared/blob/main/LICENSE): MIT
