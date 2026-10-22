@@ -4,26 +4,30 @@
 
 Each clone is judged exactly as CI would judge it (`python -m gate run --json`), with the slug
 passed so the live checks (branch protection, visibility) read the right repo. Nothing is
-written into the clones. DIR gets one <owner>__<name>.json per repo, matrix.json and matrix.md.
+written into the clones. DIR gets one <owner>__<name>.json and .txt (the printed report) per repo, matrix.json and matrix.md.
 Exit 0 always: this is a measurement, not a gate.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from gate.cli import main as gate_main  # noqa: E402  (in-process: no subprocess, no shell)
 SHORT = {"pass": "pass", "warn": "warn", "fail": "FAIL", "cannot-tell": "CANNOT", "n/a": "n/a", "ci-only": "ci", "absent": "-"}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--extra", default="", help="extra args for gate run, e.g. '--no-audit'")
+    ap.add_argument("--no-audit", action="store_true", help="pass --no-audit to each gate run")
     ap.add_argument("repos", nargs="+")
     a = ap.parse_args()
     out = Path(a.out)
@@ -33,16 +37,22 @@ def main() -> int:
         slug, _, path = spec.partition("=")
         dest = out / (slug.replace("/", "__") + ".json")
         t0 = time.time()
-        res = subprocess.run([sys.executable, "-m", "gate", "run", "--repo", path, "--repo-slug", slug, "--json", str(dest),
-                              *a.extra.split()], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        data = json.loads(dest.read_text(encoding="utf-8")) if dest.exists() else {"checks": [], "exit": res.returncode}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                code = gate_main(["run", "--repo", path, "--repo-slug", slug, "--json", str(dest),
+                                  *(["--no-audit"] if a.no_audit else [])])
+            except SystemExit as e:  # argparse errors
+                code = e.code if isinstance(e.code, int) else 2
+        (out / (slug.replace("/", "__") + ".txt")).write_text(buf.getvalue(), encoding="utf-8")
+        data = json.loads(dest.read_text(encoding="utf-8")) if dest.exists() else {"checks": [], "exit": code}
         checks = {c["check"]: c for c in data["checks"]}
-        rows.append({"repo": slug, "exit": res.returncode, "seconds": round(time.time() - t0),
+        rows.append({"repo": slug, "exit": code, "seconds": round(time.time() - t0),
                      "status": {k: v["status"] for k, v in checks.items()},
                      "blocking": {k: sum(1 for f in v["findings"] if f["severity"] == "block" and f["state"] == "open")
                                   for k, v in checks.items()},
                      "warnings": {k: sum(1 for f in v["findings"] if f["severity"] == "warn") for k, v in checks.items()}})
-        print(f"{slug}: exit {res.returncode} ({rows[-1]['seconds']}s)", flush=True)
+        print(f"{slug}: exit {code} ({rows[-1]['seconds']}s)", flush=True)
     names = []
     for r in rows:
         for k in r["status"]:
