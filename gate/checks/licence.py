@@ -24,6 +24,9 @@ from ..core import BLOCK, WARN, Repo, Result
 
 FILE_RE = re.compile(r"(?i)^(licen[cs]e|copying|unlicense)([.-][\w.-]*)?$")
 SIGNATURES = [  # order matters: the more specific text first
+    # FSL first: its text quotes the Apache or MIT licence it converts to
+    ("FSL-1.1-ALv2", [r"Functional Source License,? Version 1\.1", r"Apache (License,? Version )?2\.0 Future License"]),
+    ("FSL-1.1-MIT", [r"Functional Source License,? Version 1\.1", r"MIT Future License"]),
     ("AGPL-3.0", [r"GNU AFFERO GENERAL PUBLIC LICENSE"]),
     ("LGPL-3.0", [r"GNU LESSER GENERAL PUBLIC LICENSE", r"Version 3"]),
     ("LGPL-2.1", [r"GNU LESSER GENERAL PUBLIC LICENSE", r"Version 2\.1"]),
@@ -45,8 +48,6 @@ SIGNATURES = [  # order matters: the more specific text first
     ("ISC", [r"Permission to use, copy, modify, and(/or)? distribute this software for any purpose with or without fee"]),
     ("BSD-3-Clause", [r"Redistribution and use in source and binary forms", r"(Neither the name|names of its\s+contributors)"]),
     ("BSD-2-Clause", [r"Redistribution and use in source and binary forms"]),
-    ("FSL-1.1-ALv2", [r"Functional Source License,? Version 1\.1", r"Apache (License,? Version )?2\.0 Future License"]),
-    ("FSL-1.1-MIT", [r"Functional Source License,? Version 1\.1", r"MIT Future License"]),
     ("MIT", [r"Permission is hereby granted, free of charge"]),
 ]
 ALIASES = {
@@ -254,6 +255,11 @@ def run(repo: Repo, opts) -> Result:
             r.add(BLOCK, f"LIC-1: cannot identify the licence in {f}; add an 'SPDX-License-Identifier: <id>' line", f,
                   key=f"unknown|{f}")
     file_ids = {i for i in ids.values() if i}
+    # REUSE layout: LICENSES/<SPDX-id>.txt declares a licence that covers part of the repo
+    reuse_ids = {canon(PurePosixPath(f).stem) or PurePosixPath(f).stem for f in repo.all_tracked()
+                 if f.startswith("LICENSES/") and f.count("/") == 1}
+    if reuse_ids:
+        r.notes.append("REUSE LICENSES/: " + ", ".join(sorted(reuse_ids)))
     if len(roots) > 1 and len(file_ids) > 1:
         readme = repo.text("README.md") or ""
         expr = re.search(r"(?i)\b([\w.-]+)\s+(OR|AND)\s+([\w.-]+)\b", readme_licence_section(readme))
@@ -276,8 +282,12 @@ def run(repo: Repo, opts) -> Result:
         if val.startswith("unrecognised"):
             r.add(BLOCK, f"LIC-2: {where} states a licence the gate cannot map to SPDX ({val[14:]}); use an SPDX id",
                   where.split()[0], key=f"unrec|{where}")
-        elif file_ids and val not in file_ids:
-            r.add(BLOCK, f"LIC-2: {where} says {val}, the licence file says {', '.join(sorted(file_ids))}",
+        elif file_ids and val not in file_ids | reuse_ids:
+            hint = ""
+            if val.startswith("CC-") or val == "CC0-1.0":
+                hint = (f". If part of the repo (a paper, data, docs) is under {val}, make the split explicit: add "
+                        f"LICENSES/{val}.txt (REUSE layout) and say in the README which paths it covers")
+            r.add(BLOCK, f"LIC-2: {where} says {val}, the licence file says {', '.join(sorted(file_ids))}{hint}",
                   where.split()[0], key=f"mismatch|{where}|{val}")
     if not any(w.startswith("README") for w, _ in decl):
         r.add(WARN, "LIC-2: the README's License section names no licence", "README.md", key="readme-none")

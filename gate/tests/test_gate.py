@@ -466,6 +466,18 @@ class Licence(Base):
                                   "pyproject.toml": '[project]\nname = "demo"\nlicense = "LicenseRef-FSL-1.1-Apache-2.0"\n'})
         self.assertPasses(files, "licence", allow=("pass",))
 
+    def test_fsl_file_is_not_read_as_apache(self):
+        # elysium, third dry-run pass: FSL's text quotes the Apache licence it converts to
+        fsl = ("# Functional Source License, Version 1.1, Apache 2.0 Future License\n\n... Apache License, Version 2.0 ...\n")
+        files = dict(CLEAN_PY, **{"LICENSE": fsl, "README.md": CLEAN_PY["README.md"].replace("MIT, see", "FSL-1.1-ALv2, see")})
+        self.assertPasses(files, "licence", allow=("pass",))
+
+    def test_split_licence_needs_reuse_file(self):
+        readme = CLEAN_PY["README.md"].replace("MIT, see LICENSE.", "Code: MIT, see LICENSE. The paper text: CC-BY-4.0.")
+        out = self.assertFails(dict(CLEAN_PY, **{"README.md": readme}), "licence", "LICENSES/CC-BY-4.0.txt")
+        self.assertPasses(dict(CLEAN_PY, **{"README.md": readme, "LICENSES/CC-BY-4.0.txt": "Attribution 4.0 International\n"}),
+                          "licence", allow=("pass",))
+
     def test_consistent_passes(self):
         files = dict(CLEAN_PY, **{"package.json": json.dumps({"name": "demo", "license": "MIT"})})
         self.assertPasses(files, "licence", allow=("pass",))
