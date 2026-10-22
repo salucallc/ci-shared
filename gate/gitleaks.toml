@@ -1,0 +1,87 @@
+# Estate gitleaks config for the merge gate (gitleaks 8.30.1). Agent-made (Claude), 2026-10-22.
+#
+# Default rules, plus:
+#  - the three shapes from life-os/.gitleaks.toml (2026-10-04 GitHub secret-alert triage), which
+#    GitHub secret scanning flags with no surrounding keyword and the defaults let through;
+#  - DSNs with a real password: the 2026-10-22 saluca-labs exposure report (saluca-handoff #145)
+#    found an incident-controller DB password at 163 public refs that gitleaks missed;
+#  - estate key prefixes (SoulKey, Tiresias, OpenRouter, Resend);
+#  - a canary rule, so any repo can prove its secret scan fails (positive control).
+# k8s Secret `data:` values are base64 and carry no prefix, so no regex can judge them; the gate's
+# stdlib sweep (gate/checks/secrets.py) decodes and judges those, over the tree and history.
+# Test fixtures must build secret-shaped strings at run time, never as one literal.
+
+[extend]
+useDefault = true
+# The default kubernetes-secret-yaml rule cannot decode, so it flags base64 placeholders such as
+# CHANGEME (the partner-portal false positive in the 2026-10-22 report) as loudly as real values.
+# The gate's k8s judge decodes every data: value and judges the plaintext, over the tree and every
+# history blob, so it replaces this rule rather than duplicating it.
+disabledRules = ["kubernetes-secret-yaml"]
+
+[[rules]]
+id = "estate-telegram-bot-token"
+description = "Telegram bot token shape, any variable name (from life-os)"
+regex = '''[0-9]{8,10}:[A-Za-z0-9_-]{30,40}'''
+
+[[rules]]
+id = "estate-stripe-webhook-secret"
+description = "Stripe webhook signing secret shape (from life-os)"
+regex = '''whsec_[A-Za-z0-9+/=]{24,}'''
+
+[[rules]]
+id = "estate-google-api-key"
+description = "Google API key shape, no entropy floor (from life-os)"
+regex = '''AIza[0-9A-Za-z_-]{35}'''
+
+[[rules]]
+id = "estate-dsn-password"
+description = "Database or broker URL with an inline password"
+regex = '''(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver|clickhouse)(?:\+[a-z0-9]+)?://[^\s:/@'"`]+:([^\s@'"`/]{4,})@'''
+secretGroup = 1
+keywords = ["://"]
+
+  [[rules.allowlists]]
+  regexTarget = "secret"
+  regexes = [
+    '''(?i)^(password|passwd|pass|secret|changeme|change_me|example|sample|dummy|fake|test|postgres|root|admin|user|placeholder|redacted|localdev|dev)$''',
+    '''^(x+|\*+|\.+)$''',
+    '''^(<[^>]*>|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{.*\}\}|%\(.*\)s|%s)$''',
+    '''(?i)^your[_-]''',
+  ]
+
+[[rules]]
+id = "estate-soulkey-agent"
+description = "SoulKey agent key"
+regex = '''\bsk_agent_[A-Za-z0-9_-]{20,}'''
+keywords = ["sk_agent_"]
+
+[[rules]]
+id = "estate-soulkey-hex"
+description = "SoulKey production format, sk_ plus 64 hex"
+regex = '''\bsk_[0-9a-f]{64}\b'''
+keywords = ["sk_"]
+
+[[rules]]
+id = "estate-tiresias-key"
+description = "Tiresias API key (placeholders such as tir_your_key_here do not match: no underscores after the prefix)"
+regex = '''\btir_[A-Za-z0-9]{24,}\b'''
+keywords = ["tir_"]
+
+[[rules]]
+id = "estate-openrouter-key"
+description = "OpenRouter API key"
+regex = '''\bsk-or-v1-[0-9a-f]{64}\b'''
+keywords = ["sk-or-v1-"]
+
+[[rules]]
+id = "estate-resend-key"
+description = "Resend API key"
+regex = '''\bre_[A-Za-z0-9]{6,12}_[A-Za-z0-9]{16,40}\b'''
+keywords = ["re_"]
+
+[[rules]]
+id = "estate-gate-canary"
+description = "Merge-gate canary: a fake secret the gate's own tests plant to prove the scan fails"
+regex = '''\bSALUCA_GATE_CANARY_[A-Za-z0-9]{24,}\b'''
+keywords = ["SALUCA_GATE_CANARY_"]

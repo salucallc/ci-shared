@@ -55,4 +55,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install bandit
       - name: Run bandit
-        run: bandit -r ${{ inputs.target-paths }} --severity-level ${{ inputs.severity-level }} --confidence-level ${{ inputs.confidence-level }}
+        env:
+          TARGETS: ${{ inputs.target-paths }}
+          SEVERITY: ${{ inputs.severity-level }}
+          CONFIDENCE: ${{ inputs.confidence-level }}
+        run: |
+          # TARGETS is space-separated by contract, so it is split into an array, not quoted whole
+          read -r -a targets <<< "$TARGETS"
+          bandit -r "${targets[@]}" --severity-level "$SEVERITY" --confidence-level "$CONFIDENCE"

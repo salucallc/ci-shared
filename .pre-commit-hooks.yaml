@@ -1,0 +1,24 @@
+# pre-commit hooks for the estate merge gate. A repo adopts them with the
+# examples/pre-commit-config.yaml snippet, then:
+#   pre-commit install --hook-type pre-commit --hook-type pre-push
+#   saluca-gate bootstrap     (once per machine: the pinned gitleaks and a pip-audit venv)
+# The pre-commit hook is fast and covers only the staged files. The pre-push hook runs the whole
+# gate, the same code as CI; a red gate stops the push. Neither is a substitute for CI.
+- id: saluca-gate-fast
+  name: merge gate (staged files)
+  description: Paths, control characters, em-dashes, LF pins and secrets on staged files; gitleaks on the staged diff.
+  entry: saluca-gate fast --staged
+  language: python
+  stages: [pre-commit]
+  pass_filenames: true
+  require_serial: true
+
+- id: saluca-gate-push
+  name: merge gate (full, before push)
+  description: Every automated check of the merge standard, as CI runs it.
+  entry: saluca-gate run --repo .
+  language: python
+  stages: [pre-push]
+  pass_filenames: false
+  always_run: true
+  require_serial: true

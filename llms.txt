@@ -1,8 +1,8 @@
 # salucallc/ci-shared
 
-> Reusable GitHub Actions workflows (workflow_call) for salucallc and saluca-labs repos: Python and Node stack CI, Docker lint/build/scan, SAST, secret scanning, release on tag, and a README/llms.txt docs check. MIT licence.
+> Reusable GitHub Actions workflows (workflow_call) for salucallc and saluca-labs repos: Python and Node stack CI, Docker lint/build/scan, SAST, secret scanning, release on tag, a README/llms.txt docs check, and the estate merge gate (merge-gate.yml plus the gate/ checks it runs). MIT licence.
 
-This repo holds workflows and two small stdlib Python helpers; it is not a library or an action. Consumers call a workflow by full commit SHA, never by tag or branch. Every third-party action inside is pinned to a commit SHA.
+This repo holds workflows, small stdlib Python helpers, and the merge gate (gate/, stdlib only, runnable before a push with `python tools/gate.py run --repo <dir>`); it is not a library or an action. Consumers call a workflow by full commit SHA, never by tag or branch. Every third-party action inside is pinned to a commit SHA.
 
 If a workflow, input or tool is not listed here or in the README's Reusable workflows table, it does not exist. The complete callable surface is the eleven workflows below plus the two scripts in tools/.
 
@@ -13,7 +13,6 @@ If a workflow, input or tool is not listed here or in the README's Reusable work
 
 ## Adopt stack CI in a repo
 
-- [tools/write_caller.py](https://github.com/salucallc/ci-shared/blob/main/tools/write_caller.py): writes a consumer ci.yml pinned to a SHA (--python, --node, --no-secret-scan)
 - [reusable-python-ci.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-python-ci.yml): install, compileall, pytest when tests exist
 - [reusable-node-ci.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-node-ci.yml): install, typecheck, build, test
 - [reusable-secret-scan.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/reusable-secret-scan.yml): TruffleHog verified-only scan
@@ -21,6 +20,11 @@ If a workflow, input or tool is not listed here or in the README's Reusable work
 ## Docs check for a public repo
 
 - [repo-docs.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/repo-docs.yml): README headings, llms.txt shape, em-dash check, gitleaks over full history
+- [merge-gate.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/merge-gate.yml): the merge gate, one job per check, fan-in `Merge gate all`
+- [gate/cli.py](https://github.com/salucallc/ci-shared/blob/main/gate/cli.py): the gate's runner; checks in gate/checks/, tests in gate/tests/
+- [tools/gate.py](https://github.com/salucallc/ci-shared/blob/main/tools/gate.py): run the gate against any repo before a push
+- [tools/branch_protection.py](https://github.com/salucallc/ci-shared/blob/main/tools/branch_protection.py): dry-run proposal of branch protection for the gate
+- [tools/write_caller.py](https://github.com/salucallc/ci-shared/blob/main/tools/write_caller.py): writes a consumer ci.yml pinned to a SHA
 
 ## Docker and Python security scans
 
@@ -40,6 +44,8 @@ If a workflow, input or tool is not listed here or in the README's Reusable work
 - [self-validate.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/self-validate.yml): actionlint and yamllint over this repo
 - [self-test.yml](https://github.com/salucallc/ci-shared/blob/main/.github/workflows/self-test.yml): runs the Python and Node workflows on fixtures/ and repo-docs.yml on this repo
 - [tools/ci_inventory.py](https://github.com/salucallc/ci-shared/blob/main/tools/ci_inventory.py): read-only CI inventory of both orgs through gh
+- [CLAIMS.md](https://github.com/salucallc/ci-shared/blob/main/CLAIMS.md): what the README says the gate does, mapped to code and tests
+- [examples/](https://github.com/salucallc/ci-shared/tree/main/examples): caller workflow, pre-commit config, CLAIMS.md and PR templates
 
 ## Optional
 

@@ -1,0 +1,231 @@
+# Reusable: the estate merge gate. Every automated requirement of the merge standard, one job each.
+#
+# The standard: saluca-handoff KB/workflows/repo-merge-gate.md (requirement ids SEC-1, CLM-3, ...).
+# The checks are gate/ in this repo; `python -m gate run` runs the same code before a push.
+#
+# Caller (in each repo, .github/workflows/merge-gate.yml). Repeat the SHA in gate-ref: a called
+# workflow cannot read the ref it was called at, and the gate code is checked out at that ref.
+#   name: merge-gate
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: read
+#   jobs:
+#     gate:
+#       uses: salucallc/ci-shared/.github/workflows/merge-gate.yml@<sha>
+#       with:
+#         gate-ref: <sha>
+#
+# Require ONE status check in branch protection: "gate / Merge gate all" (the fan-in). It fails
+# when any job fails, is cancelled, or is skipped when it should have run.
+
+name: Reusable - Merge gate
+
+on:
+  workflow_call:
+    inputs:
+      gate-ref:
+        description: "The ci-shared commit SHA this workflow is pinned to (repeat the @sha). Empty only inside ci-shared."
+        type: string
+        required: false
+        default: ""
+      python-ci:
+        description: "auto (run reusable-python-ci.yml when a Python project is detected) or skip."
+        type: string
+        required: false
+        default: auto
+      node-ci:
+        description: "auto (run reusable-node-ci.yml when package.json is at the root) or skip."
+        type: string
+        required: false
+        default: auto
+      sast:
+        description: "Run bandit (Python) and semgrep."
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  PIP_AUDIT: "pip-audit==2.10.1"
+
+jobs:
+  detect:
+    name: Merge gate (detect)
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    outputs:
+      python: ${{ steps.detect.outputs.python }}
+      node: ${{ steps.detect.outputs.node }}
+    steps:
+      - name: Refuse a missing or malformed gate-ref
+        env:
+          GATE_REF: ${{ inputs.gate-ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$GATE_REF" ] && [ "$REPO" != "salucallc/ci-shared" ]; then
+            echo "::error::merge-gate.yml needs gate-ref: the same 40-character SHA as the @sha in 'uses:'"; exit 1
+          fi
+          if [ -n "$GATE_REF" ] && ! echo "$GATE_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::gate-ref must be a full 40-character commit SHA"; exit 1
+          fi
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Checkout gate code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: salucallc/ci-shared
+          ref: ${{ inputs.gate-ref != '' && inputs.gate-ref || github.sha }}
+          path: .merge-gate
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Detect stacks
+        id: detect
+        env:
+          PYTHONPATH: .merge-gate
+        run: python -m gate detect --repo .
+
+  gate:
+    name: Merge gate (${{ matrix.check }})
+    needs: detect
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [secrets, paths, control-chars, style, test-markers, claims, packaging, licence, ci-hygiene, deps, security,
+                log-redaction, consistency, mutation, branch-protection]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Checkout gate code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: salucallc/ci-shared
+          ref: ${{ inputs.gate-ref != '' && inputs.gate-ref || github.sha }}
+          path: .merge-gate
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install gitleaks (pinned version, verified checksum)
+        if: ${{ matrix.check == 'secrets' }}
+        run: |
+          set -euo pipefail
+          f="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "${RUNNER_TEMP}/${f}" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${f}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${f}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${f}" -C "${RUNNER_TEMP}" gitleaks
+          echo "GATE_GITLEAKS=${RUNNER_TEMP}/gitleaks" >> "$GITHUB_ENV"
+      - name: Install pip-audit (pinned)
+        if: ${{ matrix.check == 'deps' }}
+        run: python -m pip install "$PIP_AUDIT"
+      - name: Run the check
+        env:
+          PYTHONPATH: .merge-gate
+          GH_TOKEN: ${{ github.token }}
+          CHECK: ${{ matrix.check }}
+          BASE_REF: ${{ github.base_ref }}
+          VISIBILITY: ${{ github.event.repository.visibility }}
+          SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # This step's whole log is gate output: no command here may pass on failure.
+          git config --global --add safe.directory "$PWD"
+          args=(run --repo . --only "$CHECK" --deep --repo-slug "$SLUG" --json "${RUNNER_TEMP}/gate-${CHECK}.json")
+          if [ -n "$BASE_REF" ]; then args+=(--base-ref "origin/${BASE_REF}"); fi
+          if [ "$VISIBILITY" = "private" ] || [ "$VISIBILITY" = "public" ]; then args+=(--visibility "$VISIBILITY"); fi
+          python -m gate "${args[@]}"
+
+  docs:
+    name: Merge gate (docs)
+    if: ${{ github.event.repository.visibility != 'private' }}
+    uses: ./.github/workflows/repo-docs.yml
+    permissions:
+      contents: read
+    with:
+      check-em-dash: false
+      run-gitleaks: false
+
+  python-tests:
+    name: Merge gate (python tests)
+    needs: detect
+    if: ${{ needs.detect.outputs.python == 'true' && inputs.python-ci != 'skip' }}
+    uses: ./.github/workflows/reusable-python-ci.yml
+    permissions:
+      contents: read
+
+  node-tests:
+    name: Merge gate (node tests)
+    needs: detect
+    if: ${{ needs.detect.outputs.node == 'true' && inputs.node-ci != 'skip' }}
+    uses: ./.github/workflows/reusable-node-ci.yml
+    permissions:
+      contents: read
+
+  sast-python:
+    name: Merge gate (bandit)
+    needs: detect
+    if: ${{ needs.detect.outputs.python == 'true' && inputs.sast }}
+    uses: ./.github/workflows/reusable-sast-python.yml
+    permissions:
+      contents: read
+
+  semgrep:
+    name: Merge gate (semgrep)
+    if: ${{ inputs.sast }}
+    uses: ./.github/workflows/reusable-semgrep.yml
+    permissions:
+      contents: read
+
+  gate-all:
+    name: Merge gate all
+    needs: [detect, gate, docs, python-tests, node-tests, sast-python, semgrep]
+    if: ${{ always() }}
+    runs-on: ${{ inputs.runs-on }}
+    permissions: {}
+    steps:
+      - name: Fail unless every job that should run succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          PY: ${{ needs.detect.outputs.python == 'true' && inputs.python-ci != 'skip' }}
+          NODE: ${{ needs.detect.outputs.node == 'true' && inputs.node-ci != 'skip' }}
+          PY_SAST: ${{ needs.detect.outputs.python == 'true' && inputs.sast }}
+          SAST: ${{ inputs.sast }}
+          PUBLIC: ${{ github.event.repository.visibility != 'private' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS"])
+          expected = {"detect": True, "gate": True, "docs": os.environ["PUBLIC"] == "true",
+                      "python-tests": os.environ["PY"] == "true", "node-tests": os.environ["NODE"] == "true",
+                      "sast-python": os.environ["PY_SAST"] == "true", "semgrep": os.environ["SAST"] == "true"}
+          bad = []
+          for job, should_run in expected.items():
+              res = needs.get(job, {}).get("result", "missing")
+              if res in ("failure", "cancelled", "missing"):
+                  bad.append(f"{job}: {res}")
+              elif res == "skipped" and should_run:
+                  bad.append(f"{job}: skipped but should have run")
+              elif res == "success" or res == "skipped":
+                  print(f"{job}: {res}")
+          for b in bad:
+              print(f"::error::merge gate: {b}")
+          sys.exit(1 if bad else 0)
+          PY

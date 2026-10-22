@@ -1,0 +1,13 @@
+{
+ "version": 2,
+ "written": "2026-10-22",
+ "rule": "debt may only shrink; see repo-merge-gate.md GATE-3",
+ "note": "ids are hashes of each finding; run `python -m gate run` to see them",
+ "entries": [
+  {
+   "check": "branch-protection",
+   "id": "f0fac6b41c6325ac9702",
+   "path": ""
+  }
+ ]
+}

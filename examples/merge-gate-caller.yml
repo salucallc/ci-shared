@@ -1,0 +1,23 @@
+# .github/workflows/merge-gate.yml in a repo adopting the merge gate.
+# Use the same full SHA twice: in `uses:` and in gate-ref (a called workflow cannot read its own ref).
+# Branch protection then requires the single check "gate / Merge gate all".
+name: merge-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    uses: salucallc/ci-shared/.github/workflows/merge-gate.yml@<sha>
+    with:
+      gate-ref: <sha>
