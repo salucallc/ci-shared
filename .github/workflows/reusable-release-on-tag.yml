@@ -56,9 +56,10 @@ jobs:
       - name: Extract changelog section (best-effort)
         id: changelog
         shell: bash
+        env:
+          CL: ${{ inputs.changelog-path }}
         run: |
           set -euo pipefail
-          CL="${{ inputs.changelog-path }}"
           body_file="$(mktemp)"
           if [ -f "$CL" ]; then
             # Grab content between the first `## ` heading and the next, stripping the heading itself.

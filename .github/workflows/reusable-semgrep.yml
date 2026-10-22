@@ -55,9 +55,11 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
       - name: Install semgrep (pinned)
+        env:
+          SEMGREP_VERSION: ${{ inputs.semgrep-version }}
         run: |
           python -m pip install --upgrade pip
-          pip install "semgrep==${{ inputs.semgrep-version }}"
+          pip install "semgrep==${SEMGREP_VERSION}"
       - name: Run semgrep
         env:
           SEMGREP_CONFIGS: ${{ inputs.configs }}
