@@ -1,0 +1,122 @@
+# Reusable: repo docs check (README, llms.txt) + gitleaks full-history secret scan.
+#
+# The docs standard it enforces is summarised in the ci-shared README ("repo-docs.yml").
+# Not yet adopted by any repo.
+#
+# Caller (in each public repo, .github/workflows/docs.yml):
+#   name: docs
+#   on: [push, pull_request]
+#   permissions:
+#     contents: read
+#   jobs:
+#     docs:
+#       uses: salucallc/ci-shared/.github/workflows/repo-docs.yml@<pinned sha>
+#
+# Fails when: llms.txt is missing or not in llmstxt.org shape; a required README heading or the
+# "_Last updated: YYYY-MM-DD_" line is missing; an em-dash appears in README.md, llms.txt or
+# AGENTS.md (house style); or gitleaks finds a secret anywhere in git history.
+# gitleaks runs from its pinned release binary with a checksum check, not gitleaks-action,
+# because the action requires a paid licence key for organisation accounts.
+
+name: Reusable - Repo docs check
+
+on:
+  workflow_call:
+    inputs:
+      required-headings:
+        description: "Comma-separated README H2 headings that must exist (prefix match)."
+        type: string
+        required: false
+        default: "Status,Install,Quickstart,Usage,Citation,License,Links"
+      check-em-dash:
+        description: "Fail on U+2014 in README.md, llms.txt, AGENTS.md."
+        type: boolean
+        required: false
+        default: true
+      run-gitleaks:
+        description: "Run gitleaks over the full git history."
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: "Runner image."
+        type: string
+        required: false
+        default: ubuntu-24.04
+
+permissions: {}
+
+jobs:
+  docs:
+    name: Repo docs check
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Check README and llms.txt
+        env:
+          REQUIRED: ${{ inputs.required-headings }}
+          CHECK_DASH: ${{ inputs.check-em-dash }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, pathlib
+          errs = []
+          root = pathlib.Path(".")
+          readme = root / "README.md"
+          llms = root / "llms.txt"
+          if not readme.is_file():
+              errs.append("README.md is missing")
+          else:
+              text = readme.read_text(encoding="utf-8")
+              heads = [h.strip() for h in re.findall(r"^##\s+(.+)$", text, re.M)]
+              for req in [r.strip() for r in os.environ["REQUIRED"].split(",") if r.strip()]:
+                  if not any(h.lower().startswith(req.lower()) for h in heads):
+                      errs.append(f"README.md: missing '## {req}' section")
+              if not re.search(r"^#\s+\S", text, re.M):
+                  errs.append("README.md: no H1 title")
+              if not re.search(r"_Last updated:\s*\d{4}-\d{2}-\d{2}_", text):
+                  errs.append("README.md: missing '_Last updated: YYYY-MM-DD_' line")
+          if not llms.is_file():
+              errs.append("llms.txt is missing (see https://llmstxt.org)")
+          else:
+              lines = llms.read_text(encoding="utf-8").splitlines()
+              body = [l for l in lines if l.strip()]
+              if not body or not body[0].startswith("# "):
+                  errs.append("llms.txt: first non-blank line must be an H1 ('# name')")
+              if not any(l.startswith("> ") for l in body[1:4]):
+                  errs.append("llms.txt: a '> summary' blockquote must follow the H1")
+              if not any(l.startswith("## ") for l in body):
+                  errs.append("llms.txt: needs at least one '## ' section of links")
+              if not any(re.match(r"^- \[[^\]]+\]\([^)]+\)", l) for l in body):
+                  errs.append("llms.txt: needs at least one '- [name](url)' link")
+          if os.environ.get("CHECK_DASH") == "true":
+              for name in ("README.md", "llms.txt", "AGENTS.md"):
+                  p = root / name
+                  if p.is_file():
+                      for i, l in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                          if "\u2014" in l:
+                              errs.append(f"{name}:{i}: em-dash (house style: use a hyphen)")
+          for e in errs:
+              print(f"::error::{e}")
+          if errs:
+              sys.exit(1)
+          print("docs check passed")
+          PY
+
+      - name: gitleaks (full history)
+        if: ${{ inputs.run-gitleaks }}
+        env:
+          GL_VERSION: "8.30.1"
+          GL_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          f="gitleaks_${GL_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "${RUNNER_TEMP}/${f}" "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/${f}"
+          echo "${GL_SHA256}  ${RUNNER_TEMP}/${f}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${f}" -C "${RUNNER_TEMP}" gitleaks
+          "${RUNNER_TEMP}/gitleaks" git --redact --no-banner --exit-code 1 .
