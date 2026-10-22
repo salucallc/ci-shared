@@ -1,0 +1,350 @@
+# salucallc/ci-shared
+
+> Reusable GitHub Actions workflows (workflow_call) for salucallc and saluca-labs repos: Python and Node stack CI, Docker lint/build/scan, SAST, secret scanning, release on tag, and a README/llms.txt docs check. MIT licence.
+
+This repo holds workflows and two small stdlib Python helpers; it is not a library or an action. Consumers call a workflow by full commit SHA, never by tag or branch. Every third-party action inside is pinned to a commit SHA.
+
+If a workflow, input or tool is not listed here or in the README's Reusable workflows table, it does not exist. The complete callable surface is the eleven workflows below plus the two scripts in tools/.
+
+The full text of this repository's prose docs, concatenated, each under its path. Regenerate this file whenever one of them changes.
+
+## README.md
+
+### salucallc/ci-shared
+
+Reusable GitHub Actions workflows for [salucallc](https://github.com/salucallc) repositories. Derived from the `salucallc/gmail-mcp` CI template (Python + Docker security baseline) and generalized so multiple repos can adopt the same gates with a one-line `uses:` reference.
+
+#### How it works
+
+How a consumer repo calls these workflows, traced from the workflow files, `tools/write_caller.py` and the caller examples in this README. Every arrow from a consumer is a `uses: salucallc/ci-shared/.github/workflows/<file>@<full commit sha>` line; the labels on the `ci.yml` arrows are the `write_caller.py` flags that add each job. No reusable workflow calls another reusable workflow: every `uses:` inside them is a third-party action pinned to a commit SHA.
+
+```mermaid
+flowchart LR
+  wc["tools/write_caller.py"] -- "writes" --> ci
+  subgraph consumers["consumer repo"]
+    ci["ci.yml from write_caller.py"]
+    ex["ci.yml, Python + Docker example"]
+    docs["docs.yml"]
+    tag["workflow on a v* tag push"]
+  end
+  subgraph callable["ci-shared workflows"]
+    py["reusable-python-ci.yml"]
+    node["reusable-node-ci.yml"]
+    ss["reusable-secret-scan.yml"]
+    sec["reusable-lint-dockerfile.yml<br/>reusable-dep-scan-python.yml<br/>reusable-sast-python.yml<br/>reusable-semgrep.yml<br/>reusable-build-smoke-docker.yml<br/>reusable-image-cve-scan.yml"]
+    rd["repo-docs.yml"]
+    rel["reusable-release-on-tag.yml"]
+  end
+  ci -- "--python" --> py
+  ci -- "--node" --> node
+  ci -- "unless --no-secret-scan" --> ss
+  ex --> sec
+  ex --> ss
+  docs --> rd
+  tag --> rel
+```
+
+#### Status
+
+Maintained. Ten reusable workflows (`reusable-*.yml`) plus `repo-docs.yml`, all invoked with `workflow_call`. `self-validate.yml` runs actionlint and yamllint over `.github/` on every PR, and `self-test.yml` runs the Python and Node stack workflows against `fixtures/` and `repo-docs.yml` against this repo. The other workflows are exercised by the repos that call them, not by this repo's CI.
+
+`repo-docs.yml` is new and not yet called by any repo.
+
+##### Corrections, 2026-10-22
+
+- This README listed `image-tag` as an input of `reusable-build-smoke-docker.yml`. The input is `image-name`.
+- This README listed `image-ref` as an input of `reusable-image-cve-scan.yml`. That workflow has no `image-ref` input: it takes `context`, `dockerfile` and `image-name` and rebuilds the image itself before scanning.
+- This README said Dependabot is configured for the `github-actions` and `pip` ecosystems. `.github/dependabot.yml` configures `github-actions` only; pinned pip tools are bumped by hand (see Pinning policy).
+- This README said every callable workflow grants `contents: read` per job. `reusable-release-on-tag.yml` grants `contents: write`, which creating a release needs; the Architecture list now says so.
+- The example consumer workflow below had a `ci-all` fan-in job with `needs:` and no `if: always()`. When a needed job fails, such a job is skipped, and GitHub reports a skipped job as passing a required check, so a failing PR could merge. The example now uses the same fan-in pattern as `self-validate.yml`.
+
+#### Install
+
+Nothing to install. A consuming repo references a workflow by commit SHA in its own `.github/workflows/*.yml`. The helper scripts in `tools/` use the Python standard library only (tested with Python 3.12); `tools/ci_inventory.py` also needs an authenticated `gh` CLI.
+
+#### Quickstart
+
+Write a stack CI caller for a repo, pinned to a ci-shared commit:
+
+```console
+$ python tools/write_caller.py demo --branch main --sha ee9a171f6e0518a6442aada81194a2a8148e57ff --python .
+demo/.github/workflows/ci.yml
+```
+
+The file it wrote (real output, 2026-10-22):
+
+```yaml
+# CI via salucallc/ci-shared reusable workflows (pinned by commit SHA).
+# Inputs, adoption and re-pinning: see the salucallc/ci-shared README.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    uses: salucallc/ci-shared/.github/workflows/reusable-python-ci.yml@ee9a171f6e0518a6442aada81194a2a8148e57ff
+  secret-scan:
+    uses: salucallc/ci-shared/.github/workflows/reusable-secret-scan.yml@ee9a171f6e0518a6442aada81194a2a8148e57ff
+```
+
+A SHA that is not 40 hex characters is refused (`--sha must be a full 40-character commit SHA`, exit 1). The script checks the format only; it does not check that the commit exists on ci-shared `main`.
+
+#### Usage
+
+All workflows live in `.github/workflows/` and are invoked with `workflow_call`. Consuming repos reference them by SHA, not tag, to avoid tag-force-push supply-chain risk. Dependabot in this repo bumps pinned third-party action SHAs; consumers should run their own Dependabot to bump the pinned SHA of THIS repo they consume.
+
+##### Reusable workflows
+
+Every workflow below also takes `runs-on` (default `ubuntu-24.04`).
+
+| Workflow | Purpose | Key inputs |
+|---|---|---|
+| `reusable-lint-dockerfile.yml` | Hadolint Dockerfile lint | `dockerfile` (default `Dockerfile`), `failure-threshold` (default `warning`) |
+| `reusable-dep-scan-python.yml` | pip-audit + safety CVE matrix | `requirements-file` (default `requirements.txt`), `python-version` (default `3.12`) |
+| `reusable-sast-python.yml` | Bandit SAST | `target-paths` (default `.`), `severity-level` (default `medium`), `confidence-level` (default `medium`) |
+| `reusable-semgrep.yml` | Semgrep OWASP/Python/secrets/CI rulepacks | `configs` (default set), `severity` (default `ERROR`), `semgrep-version` (default `1.160.0`) |
+| `reusable-secret-scan.yml` | TruffleHog verified-only secret scan | `only-verified` (default `true`), `scan-path` (default `./`) |
+| `reusable-build-smoke-docker.yml` | Buildx smoke build of a Dockerfile | `context` (default `.`), `dockerfile` (default `Dockerfile`), `image-name` |
+| `reusable-image-cve-scan.yml` | Rebuilds the image locally, then a Trivy scan | `context`, `dockerfile`, `image-name`, `severity` (default `HIGH,CRITICAL`), `ignore-unfixed` (default `true`), `vuln-type` (default `os,library`) |
+| `reusable-release-on-tag.yml` | Release + changelog on `v*` tag push | `changelog-path` (default `CHANGELOG.md`), `prerelease`, `generate-release-notes` |
+| `reusable-python-ci.yml` | Install (uv / poetry / pip, from the lockfile), `compileall`, `pytest` when tests exist | `python-version` (default `3.12`), `working-directory`, `install-command`, `compile-command`, `test-command`, `extra-packages`, `apt-packages` |
+| `reusable-node-ci.yml` | Install (npm / pnpm / yarn, frozen lockfile), typecheck, build, test | `node-version` (default `22`), `working-directory`, `install-command`, `typecheck-command`, `build-command`, `test-command` |
+| `repo-docs.yml` | README and `llms.txt` shape check, em-dash check, gitleaks over full history | `required-headings`, `check-em-dash` (default `true`), `run-gitleaks` (default `true`) |
+
+The two stack workflows take `auto`, `skip` or a shell command for each step. `auto` detects from
+the repo; `skip` logs that the step did not run. A step that found nothing to run says so with a
+notice rather than passing silently. `self-test.yml` runs both against `fixtures/` on every PR.
+
+##### Adopting the stack CI (the estate's default)
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  python:
+    uses: salucallc/ci-shared/.github/workflows/reusable-python-ci.yml@<commit-sha>
+  secret-scan:
+    uses: salucallc/ci-shared/.github/workflows/reusable-secret-scan.yml@<commit-sha>
+```
+
+This repo is public, so private repos in both `salucallc` and `saluca-labs` can call it (a private
+reusable workflow could only be shared inside its own org).
+
+##### Docs check for public repos (`repo-docs.yml`)
+
+For a public repo, add `.github/workflows/docs.yml`:
+
+```yaml
+name: docs
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  docs:
+    uses: salucallc/ci-shared/.github/workflows/repo-docs.yml@<commit-sha>
+```
+
+It fails when:
+
+- `README.md` is missing, has no H1, lacks a required `## ` heading (prefix match, case-insensitive), or lacks a `_Last updated: YYYY-MM-DD_` line. The default headings are `Status,Install,Quickstart,Usage,Citation,License,Links`.
+- `llms.txt` is missing or not in [llmstxt.org](https://llmstxt.org) shape: an H1 first, a `> ` summary within the next three non-blank lines, at least one `## ` section and at least one `- [name](url)` link.
+- `README.md`, `llms.txt` or `AGENTS.md` contains an em-dash (U+2014), unless `check-em-dash: false`.
+- gitleaks finds a secret anywhere in git history, unless `run-gitleaks: false`. gitleaks 8.30.1 runs from its release binary after a SHA-256 check, not through `gitleaks-action`, which needs a paid licence key for organisation accounts. Reviewed false positives go in the calling repo's `.gitleaksignore`, one fingerprint per line, with a comment saying why.
+
+A data-only repo can narrow the headings:
+
+```yaml
+jobs:
+  docs:
+    uses: salucallc/ci-shared/.github/workflows/repo-docs.yml@<commit-sha>
+    with:
+      required-headings: "Status,Usage,Citation,License,Links"
+```
+
+##### Tools
+
+`tools/write_caller.py` writes the stack CI caller file for a repo (`--node DIR[:k=v,...]`, `--python DIR[:k=v,...]`, `--branch`, `--sha`, `--no-secret-scan`, `--force`); it refuses a SHA that is not a full 40-character commit, and refuses to overwrite an existing `ci.yml` without `--force`.
+
+`tools/ci_inventory.py` lists every repo in both orgs with its stack, workflows, default-branch CI
+state and open dependency PRs (read-only, through `gh`).
+
+##### Example consumer workflow (Python + Docker)
+
+```yaml
+# .github/workflows/ci.yml in a consuming repo
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions: read-all
+jobs:
+  lint-dockerfile:
+    uses: salucallc/ci-shared/.github/workflows/reusable-lint-dockerfile.yml@<commit-sha>
+  dep-scan:
+    uses: salucallc/ci-shared/.github/workflows/reusable-dep-scan-python.yml@<commit-sha>
+  sast:
+    uses: salucallc/ci-shared/.github/workflows/reusable-sast-python.yml@<commit-sha>
+  semgrep:
+    uses: salucallc/ci-shared/.github/workflows/reusable-semgrep.yml@<commit-sha>
+  secret-scan:
+    uses: salucallc/ci-shared/.github/workflows/reusable-secret-scan.yml@<commit-sha>
+  build-smoke:
+    uses: salucallc/ci-shared/.github/workflows/reusable-build-smoke-docker.yml@<commit-sha>
+  image-cve-scan:
+    uses: salucallc/ci-shared/.github/workflows/reusable-image-cve-scan.yml@<commit-sha>
+  ci-all:
+    needs: [lint-dockerfile, dep-scan, sast, semgrep, secret-scan, build-smoke, image-cve-scan]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail if a required job did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: exit 1
+      - run: echo "All required CI jobs succeeded."
+```
+
+Make `ci-all` the single required status check in branch protection; adding or renaming reusable workflows will not require touching branch protection. `image-cve-scan` rebuilds the image itself, so it does not need `build-smoke` to run first.
+
+#### Architecture
+
+The consumer call graph is under [How it works](#how-it-works). This repo's own CI, traced from `self-test.yml` and `self-validate.yml` (solid arrows are local `uses: ./.github/workflows/...` calls; the dotted arrow is linting only, no call):
+
+```mermaid
+flowchart LR
+  st["self-test.yml"] -- "fixtures/python-min" --> py["reusable-python-ci.yml"]
+  st -- "fixtures/node-min" --> node["reusable-node-ci.yml"]
+  st -- "this repo" --> rd["repo-docs.yml"]
+  sv["self-validate.yml<br/>actionlint + yamllint"] -. "lints" .-> wf[".github/ (workflows, dependabot.yml)"]
+```
+
+The files:
+
+- `.github/workflows/reusable-*.yml`, `repo-docs.yml`: the callable workflows. Each sets `permissions: {}` at the top and grants per job only what that job uses: `contents: read`, except `reusable-release-on-tag.yml`, which grants `contents: write` to create the release.
+- `.github/workflows/self-validate.yml`: actionlint 1.7.12 (checksum-verified) and yamllint 1.35.1 with `.yamllint.yml`, plus a `ci-all` fan-in.
+- `.github/workflows/self-test.yml`: calls the Python and Node workflows on `fixtures/python-min` and `fixtures/node-min`, and `repo-docs.yml` on this repo, by local path.
+- `tools/`: `write_caller.py` and `ci_inventory.py`.
+- `.gitattributes` pins LF line endings.
+
+#### Pinning policy
+
+- Third-party actions pinned to a **commit SHA**, never a tag.
+- Pinned tools fetched inside workflows (e.g. `semgrep==1.160.0`, actionlint, gitleaks) are bumped in follow-up PRs alongside rulepack review; release binaries are checked against a pinned SHA-256.
+- Dependabot is configured for the `github-actions` ecosystem only, weekly.
+
+#### Citation
+
+No archived record yet.
+
+#### License
+
+MIT. See [LICENSE](LICENSE).
+
+#### Links
+
+- [salucallc/.github](https://github.com/salucallc/.github): org-wide community health defaults
+- [llmstxt.org](https://llmstxt.org): the `llms.txt` format `repo-docs.yml` checks
+- [gitleaks](https://github.com/gitleaks/gitleaks): the secret scanner `repo-docs.yml` runs
+
+_Last updated: 2026-10-22_
+
+## AGENTS.md
+
+### AGENTS.md
+
+Instructions for AI coding agents working in this repository.
+
+#### What this is
+
+Reusable GitHub Actions workflows (`on: workflow_call`) that other repos call by full commit SHA, plus two
+standard-library Python helpers in `tools/`. It is not a library, an action or a service.
+
+#### Read in this order
+
+1. `README.md`, "How it works" (the call graph) and the Reusable workflows table (every input).
+2. The workflow you are changing, in `.github/workflows/`.
+3. `.github/workflows/self-test.yml` and `self-validate.yml`: what proves a change works.
+4. `tools/write_caller.py`, if the change affects what a consumer's `ci.yml` should contain.
+
+#### What you can and cannot see
+
+- You can see every workflow, the fixtures they are tested on, and the helpers.
+- You cannot see the consumer repos. Some are private. A change to an input breaks a consumer only
+  when it re-pins to the new SHA, so nothing in this repo's CI will tell you.
+- Only `reusable-python-ci.yml`, `reusable-node-ci.yml` and `repo-docs.yml` are run by this repo's
+  CI (`self-test.yml`). The other reusable workflows are linted here but only run in consumers.
+
+#### The only numbers to trust
+
+- Pinned tool versions: actionlint and yamllint in `.github/workflows/self-validate.yml`, gitleaks in
+  `.github/workflows/repo-docs.yml`, semgrep in the `semgrep-version` default of
+  `.github/workflows/reusable-semgrep.yml`. Read them from those files, not from prose.
+- Action pins: the `uses: ...@<sha>  # vX.Y.Z` lines in each workflow file.
+- The list of workflows: `ls .github/workflows/`.
+
+#### Setup
+
+Nothing to install for the workflows. To lint locally, install yamllint 1.35.1
+(`python -m pip install yamllint==1.35.1`) and actionlint 1.7.12 from its release page, checking the
+SHA-256 against the release's checksums file. actionlint runs shellcheck on `run:` blocks when
+shellcheck is on PATH; CI runners have it.
+
+#### Test
+
+```sh
+yamllint --strict -c .yamllint.yml .github/
+actionlint
+python tools/write_caller.py --help
+```
+
+Passing: yamllint and actionlint print nothing and exit 0. On a PR, `Self-validate` (actionlint,
+yamllint, `CI all`) and `Self-test` (Python fixture, Node fixture, repo-docs on this repo) must be green.
+
+#### Conventions
+
+- Reusable workflows are named `reusable-<what>.yml` with `name: Reusable - <What>` (`repo-docs.yml`
+  keeps its shorter path because the docs standard's caller references it).
+- Top-level `permissions: {}`; each job grants only what it needs (normally `contents: read`).
+- Every third-party action is pinned to a full commit SHA with the version in a trailing comment
+  (`uses: actions/checkout@<sha>  # v6.0.2`). Use the same pin as the other workflows.
+- Release binaries fetched in a workflow (actionlint, gitleaks) are pinned by version and SHA-256 and
+  downloaded to `${RUNNER_TEMP}`, not into the checkout.
+- Inputs are kebab-case, have a `description`, `required: false` and a default, and every workflow
+  takes `runs-on` (default `ubuntu-24.04`).
+- `tools/` is Python standard library only. LF line endings (`.gitattributes`).
+- When a workflow's inputs change, update the README table in the same PR, and regenerate
+  `llms-full.txt` (the `llms.txt` header, then README.md and AGENTS.md, each under its path).
+- No em-dashes in README.md, llms.txt or AGENTS.md (`repo-docs.yml` fails on them).
+
+#### Do not
+
+- Pin anything by tag or branch, or widen `permissions` beyond what a job uses.
+- Rename or remove an input without a note in the README: consumers pin SHAs and break silently on re-pin.
+- Commit secrets, hostnames, internal paths or personal emails.
+- Commit `__pycache__` or `.pyc` files.
+
+#### Done means
+
+`Self-validate` and `Self-test` are green on the PR, and the README describes every input that changed.
