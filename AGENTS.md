@@ -2,6 +2,34 @@
 
 Instructions for AI coding agents working in this repository.
 
+## What this is
+
+Reusable GitHub Actions workflows (`on: workflow_call`) that other repos call by full commit SHA, plus two
+standard-library Python helpers in `tools/`. It is not a library, an action or a service.
+
+## Read in this order
+
+1. `README.md`, "How it works" (the call graph) and the Reusable workflows table (every input).
+2. The workflow you are changing, in `.github/workflows/`.
+3. `.github/workflows/self-test.yml` and `self-validate.yml`: what proves a change works.
+4. `tools/write_caller.py`, if the change affects what a consumer's `ci.yml` should contain.
+
+## What you can and cannot see
+
+- You can see every workflow, the fixtures they are tested on, and the helpers.
+- You cannot see the consumer repos. Some are private. A change to an input breaks a consumer only
+  when it re-pins to the new SHA, so nothing in this repo's CI will tell you.
+- Only `reusable-python-ci.yml`, `reusable-node-ci.yml` and `repo-docs.yml` are run by this repo's
+  CI (`self-test.yml`). The other reusable workflows are linted here but only run in consumers.
+
+## The only numbers to trust
+
+- Pinned tool versions: actionlint and yamllint in `.github/workflows/self-validate.yml`, gitleaks in
+  `.github/workflows/repo-docs.yml`, semgrep in the `semgrep-version` default of
+  `.github/workflows/reusable-semgrep.yml`. Read them from those files, not from prose.
+- Action pins: the `uses: ...@<sha>  # vX.Y.Z` lines in each workflow file.
+- The list of workflows: `ls .github/workflows/`.
+
 ## Setup
 
 Nothing to install for the workflows. To lint locally, install yamllint 1.35.1
@@ -41,7 +69,7 @@ tests, and the merge gate on this repo) must be green.
   new check, or a new rule in one, adds both. Secret-shaped test strings are built at run time.
 - Severities and caps are constants in the gate code. Never add a config key that lowers one. LF line endings (`.gitattributes`).
 - When a workflow's inputs change, update the README table in the same PR, and regenerate
-  `llms-full.txt` (the `llms.txt` header, then `## README.md` and the README text).
+  `llms-full.txt` (the `llms.txt` header, then README.md and AGENTS.md, each under its path).
 - No em-dashes in README.md, llms.txt or AGENTS.md (`repo-docs.yml` fails on them).
 
 ## Do not
