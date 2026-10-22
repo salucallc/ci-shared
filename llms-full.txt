@@ -1,8 +1,8 @@
 # salucallc/ci-shared
 
-> Reusable GitHub Actions workflows (workflow_call) for salucallc and saluca-labs repos: Python and Node stack CI, Docker lint/build/scan, SAST, secret scanning, release on tag, and a README/llms.txt docs check. MIT licence.
+> Reusable GitHub Actions workflows (workflow_call) for salucallc and saluca-labs repos: Python and Node stack CI, Docker lint/build/scan, SAST, secret scanning, release on tag, a README/llms.txt docs check, and the estate merge gate (merge-gate.yml plus the gate/ checks it runs). MIT licence.
 
-This repo holds workflows and two small stdlib Python helpers; it is not a library or an action. Consumers call a workflow by full commit SHA, never by tag or branch. Every third-party action inside is pinned to a commit SHA.
+This repo holds workflows, small stdlib Python helpers, and the merge gate (gate/, stdlib only, runnable before a push with `python tools/gate.py run --repo <dir>`); it is not a library or an action. Consumers call a workflow by full commit SHA, never by tag or branch. Every third-party action inside is pinned to a commit SHA.
 
 ## README.md
 
@@ -14,7 +14,7 @@ Reusable GitHub Actions workflows for [salucallc](https://github.com/salucallc) 
 
 Maintained. Ten reusable workflows (`reusable-*.yml`) plus `repo-docs.yml`, all invoked with `workflow_call`. `self-validate.yml` runs actionlint and yamllint over `.github/` on every PR, and `self-test.yml` runs the Python and Node stack workflows against `fixtures/` and `repo-docs.yml` against this repo. The other workflows are exercised by the repos that call them, not by this repo's CI.
 
-`repo-docs.yml` is new and not yet called by any repo.
+`repo-docs.yml` and `merge-gate.yml` are new and not yet called by any repo. `self-test.yml` runs the gate's own tests and `merge-gate.yml` against this repo.
 
 ### Corrections, 2026-10-22
 
@@ -86,6 +86,7 @@ Every workflow below also takes `runs-on` (default `ubuntu-24.04`).
 | `reusable-python-ci.yml` | Install (uv / poetry / pip, from the lockfile), `compileall`, `pytest` when tests exist | `python-version` (default `3.12`), `working-directory`, `install-command`, `compile-command`, `test-command`, `extra-packages`, `apt-packages` |
 | `reusable-node-ci.yml` | Install (npm / pnpm / yarn, frozen lockfile), typecheck, build, test | `node-version` (default `22`), `working-directory`, `install-command`, `typecheck-command`, `build-command`, `test-command` |
 | `repo-docs.yml` | README and `llms.txt` shape check, em-dash check, gitleaks over full history | `required-headings`, `check-em-dash` (default `true`), `run-gitleaks` (default `true`) |
+| `merge-gate.yml` | The merge gate: every automated check of the estate merge standard, one job each, plus a fan-in (`Merge gate all`) | `gate-ref` (the same SHA as `uses:`), `python-ci`, `node-ci` (`auto` or `skip`), `sast` (default `true`) |
 
 The two stack workflows take `auto`, `skip` or a shell command for each step. `auto` detects from
 the repo; `skip` logs that the step did not run. A step that found nothing to run says so with a
@@ -143,6 +144,73 @@ jobs:
     with:
       required-headings: "Status,Usage,Citation,License,Links"
 ```
+
+### Merge gate (`merge-gate.yml`, `gate/`)
+
+The estate's last check before anything merges: every automated requirement of the merge
+standard (saluca-handoff `KB/workflows/repo-merge-gate.md`), one CI job each, and the same code
+runnable before a push. It is new and not yet called by any repo.
+
+Adopt it with one caller file, pinned to the same SHA twice:
+
+```yaml
+# .github/workflows/merge-gate.yml  (python tools/write_caller.py <repo> --branch main --sha <sha> --merge-gate)
+jobs:
+  gate:
+    uses: salucallc/ci-shared/.github/workflows/merge-gate.yml@<commit-sha>
+    with:
+      gate-ref: <commit-sha>
+```
+
+Branch protection then requires one check, `gate / Merge gate all`, the fan-in. It fails when a
+job fails, is cancelled, or is skipped when it should have run. `tools/branch_protection.py`
+prints the protection it would set for each public repo; it changes nothing without `--apply`.
+
+What each job checks (the requirement ids are the standard's):
+
+| Job | Ids | Fails when |
+|---|---|---|
+| `secrets` | SEC-1..4 | gitleaks 8.30.1 (checksum-verified, estate rules in `gate/gitleaks.toml`) finds a secret in any commit of any ref; or the stdlib sweep finds a k8s Secret `data:` value that decodes to a real value, a database URL with a real password, a secret-shaped value in an env template, or a committed `.env`, key or service-account file, in the tree or in any history blob |
+| `paths` | TST-3, EXP-1 | an estate path or tailnet host anywhere; an absolute drive or home path in code or config |
+| `control-chars` | TST-4 | a control character that a mangled backslash escape leaves (TAB after text in Python or JS, 0x07, 0x08, 0x0B, 0x0C), a bare CR, or an invisible or bidi character |
+| `style` | STY-1, STY-3 | an em-dash in any prose file; a shell, Dockerfile or cron file stored with CRLF or not LF-pinned in `.gitattributes` |
+| `test-markers` | TST-1, TST-2 | source code with no tests; a skip or xfail without a reason and an issue link; a bulk xfail; more than 10 markers |
+| `claims` | CLM-1..7 | no `CLAIMS.md`, or a claim row whose text is not in its source doc, whose code or test does not exist, whose code is a stub, whose mount point does not contain the named text, whose test is skipped, which is `planned` but read as working, or which is withdrawn with no dated correction note |
+| `packaging` | PKG-1, PKG-2 | a README install line names a package its registry does not have (PyPI, npm, crates.io), unless the README says it is not yet published |
+| `licence` | LIC-1..4 | no licence file; the README, package metadata, CITATION.cff, `.zenodo.json`, NOTICE or the Zenodo record disagree with it; a change in the last 90 days has no dated note |
+| `ci-hygiene` | CI-1..5 | no CI on pull requests, no test run, `continue-on-error`, a failure swallowed with `\|\| true`, or the gate not adopted |
+| `branch-protection` | CI-6 | the default branch is unprotected, or does not require the gate (a repo setting, read live) |
+| `deps` | DEP-1..3 | Node dependencies with no lockfile; pip-audit or npm audit finds a vulnerability with a released fix |
+| `security` | SEC-5..8 | proxy code forwards the incoming headers upstream; a secret reaches a log; auth defaults off, or an unauthenticated mode has no test; code writes another tool's user config without consent and a backup |
+| `log-redaction` | SEC-9 | code generates keys and no test proves a key never reaches a log |
+| `consistency` | CON-1, CON-2 | warnings only: a home-grown hash chain, or one with no truncation test (the estate format is an open decision) |
+| `mutation` | TST-5 | opt-in: no mutant of a declared target is caught, so its tests pass whatever the code does |
+| `docs` | DOC-1 | `repo-docs.yml`, called with its em-dash and gitleaks steps off because `style` and `secrets` cover them |
+| `python-tests`, `node-tests`, `bandit`, `semgrep` | TST-1, SEC-10 | the existing stack and SAST workflows, called when the stack is detected |
+
+The gate fails closed. A tool it cannot run, a registry it cannot reach, or a file it cannot read
+is cannot-tell (exit 2), which fails the gate, never a pass.
+
+Run it before a push (Python 3.11+, standard library only):
+
+```console
+$ python tools/gate.py bootstrap          # once: pinned gitleaks and a pip-audit venv in ~/.cache/saluca-gate
+$ python tools/gate.py run --repo ../my-repo
+```
+
+or install the hooks in `.pre-commit-hooks.yaml` (`examples/pre-commit-config.yaml`): a fast
+pre-commit hook on staged files, and a pre-push hook that runs the whole gate.
+
+A repo's `.gate.toml` cannot switch a check off or lower a severity. It can waive one named
+finding, with a reason, a GitHub issue link and an expiry date of at most a year, and the waiver
+is printed on every run. Secrets cannot be waived. Pre-existing findings can be recorded once in
+`.gate-baseline.json` (`python tools/gate.py baseline`) so that adopting the gate does not freeze a
+repo; on a pull request the baseline may only shrink.
+
+`gate/tests/test_gate.py` holds a fixture that must fail and one that must pass for every check.
+The fixtures plant a fake secret with a fake prefix, a hardcoded path, an xfail with no reason, an
+install line for a package that is not on PyPI, and a broken claims reference, among others. Each
+check was also sabotaged in a copy of the gate, and its tests went red every time.
 
 ### Tools
 
@@ -206,7 +274,9 @@ flowchart LR
 - `.github/workflows/reusable-*.yml`, `repo-docs.yml`: the callable workflows. Each sets `permissions: {}` at the top and grants `contents: read` per job.
 - `.github/workflows/self-validate.yml`: actionlint 1.7.12 (checksum-verified) and yamllint 1.35.1 with `.yamllint.yml`, plus a `ci-all` fan-in.
 - `.github/workflows/self-test.yml`: calls the Python and Node workflows on `fixtures/python-min` and `fixtures/node-min`, and `repo-docs.yml` on this repo, by local path.
-- `tools/`: `write_caller.py` and `ci_inventory.py`.
+- `tools/`: `write_caller.py`, `ci_inventory.py`, `gate.py` (runs the merge gate from a checkout) and `branch_protection.py` (dry-run proposal of the protection to set).
+- `gate/`: the merge gate's checks (standard library only), its gitleaks config and its tests. `.pre-commit-hooks.yaml` and `pyproject.toml` exist only so pre-commit can install it.
+- `examples/`: the caller workflow, the pre-commit config, a `CLAIMS.md` template and a pull request template with the standard's human-review items.
 - `.gitattributes` pins LF line endings.
 
 ## Pinning policy

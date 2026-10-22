@@ -1,0 +1,7 @@
+# .pre-commit-config.yaml for a repo adopting the merge gate. Pin rev to a full ci-shared SHA.
+repos:
+  - repo: https://github.com/salucallc/ci-shared
+    rev: <40-character ci-shared commit SHA>
+    hooks:
+      - id: saluca-gate-fast
+      - id: saluca-gate-push

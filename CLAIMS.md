@@ -1,0 +1,21 @@
+# Claims
+
+What this repo's README says the merge gate does, mapped to the code that does it, where it is
+wired in, and the test that proves it. The merge gate's `claims` check reads this table on every
+pull request (template: `examples/CLAIMS.md`). The reusable workflows' behaviour is proven by
+`self-test.yml` runs rather than by rows here.
+
+| id | claim | source | status | code | wired | test | note |
+|---|---|---|---|---|---|---|---|
+| C1 | finds a secret in any commit of any ref | README.md | shipped | gate/checks/secrets.py::run_gitleaks | gate/checks/secrets.py: run_gitleaks(repo, r) | gate/tests/test_gate.py::Secrets::test_secret_removed_later_still_fails_from_history | |
+| C2 | a k8s Secret data: value that decodes to a real value | README.md | shipped | gate/checks/secrets.py::_k8s | gate/checks/secrets.py: yield from _k8s(text) | gate/tests/test_gate.py::Secrets::test_k8s_secret_base64_value_fails | |
+| C3 | a database URL with a real password | README.md | shipped | gate/checks/secrets.py::judge_text | gate/checks/secrets.py: judge_text(path, text, "history") | gate/tests/test_gate.py::Secrets::test_dsn_password_in_env_example_fails | |
+| C4 | a README install line names a package its registry does not have | README.md | shipped | gate/checks/packaging.py::lookup | gate/cli.py: "packaging": (packaging.run | gate/tests/test_gate.py::Packaging::test_unpublished_package_claim_fails | |
+| C5 | whose code or test does not exist | README.md | shipped | gate/checks/claims.py::resolve | gate/checks/claims.py: sev, msg = resolve(repo, ref) | gate/tests/test_gate.py::Claims::test_broken_code_reference_fails | |
+| C6 | whose mount point does not contain the named text | README.md | shipped | gate/checks/claims.py::resolve_wired | gate/checks/claims.py: resolve_wired(repo, row.get("wired", "")) | gate/tests/test_gate.py::Claims::test_not_mounted_fails | |
+| C7 | proxy code forwards the incoming headers upstream | README.md | shipped | gate/checks/security.py::PyScan::visit_Call | gate/checks/security.py: py_scan(rel, text) | gate/tests/test_gate.py::Security::test_proxy_forwards_incoming_headers_fails | |
+| C8 | a skip or xfail without a reason and an issue link | README.md | shipped | gate/checks/test_markers.py::judge | gate/checks/test_markers.py: judge(rel, text) | gate/tests/test_gate.py::TestMarkers::test_xfail_without_reason_fails | |
+| C9 | is cannot-tell (exit 2), which fails the gate, never a pass | README.md | shipped | gate/cli.py::verdict | gate/cli.py: code = verdict(results) | gate/tests/test_gate.py::Secrets::test_missing_gitleaks_is_cannot_tell | |
+| C10 | Secrets cannot be waived | README.md | shipped | gate/cli.py::waivers | gate/cli.py: ws = waivers(repo, cfg, today) | gate/tests/test_gate.py::GateConfig::test_secrets_cannot_be_waived | |
+| C11 | on a pull request the baseline may only shrink | README.md | shipped | gate/cli.py::apply_baseline | gate/cli.py: apply_baseline(repo, results, cfg, a.base_ref) | gate/tests/test_gate.py::GateConfig::test_baseline_absorbs_debt_and_may_only_shrink | |
+| C12 | no mutant of a declared target is caught | README.md | shipped | gate/checks/mutation.py::mutants | gate/checks/mutation.py: mutants(original.decode("utf-8"), limit) | gate/tests/test_gate.py::Mutation::test_tests_that_cannot_fail_fail | |

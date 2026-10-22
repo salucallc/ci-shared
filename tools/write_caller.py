@@ -8,6 +8,11 @@ Each --node / --python adds one job running that stack workflow in DIR (use . fo
 key=value pairs become `with:` inputs (e.g. test-command=skip, node-version=20). The SHA must
 be a full 40-character commit on ci-shared main: consumers pin by SHA, never by tag or branch.
 Refuses to overwrite an existing ci.yml unless --force.
+
+  python tools/write_caller.py <repo_dir> --branch main --sha <ci-shared commit> --merge-gate
+
+writes .github/workflows/merge-gate.yml instead: the merge gate caller, with the SHA in both
+`uses:` and `gate-ref` (merge-gate.yml checks out its own code at that ref).
 """
 from __future__ import annotations
 
@@ -64,6 +69,33 @@ def render(branch: str, sha: str, jobs: list[tuple[str, str, list[str]]], secret
     return "\n".join(out) + "\n"
 
 
+def render_gate(branch: str, sha: str) -> str:
+    return "\n".join([
+        "# Merge gate via salucallc/ci-shared (pinned by commit SHA; the same SHA in gate-ref).",
+        "# The standard: saluca-handoff KB/workflows/repo-merge-gate.md. Require 'gate / Merge gate all'.",
+        "name: merge-gate",
+        "",
+        "on:",
+        "  pull_request:",
+        "  push:",
+        f"    branches: [{branch}]",
+        "  workflow_dispatch:",
+        "",
+        "concurrency:",
+        "  group: ${{ github.workflow }}-${{ github.ref }}",
+        "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+        "",
+        "permissions:",
+        "  contents: read",
+        "",
+        "jobs:",
+        "  gate:",
+        f"    uses: {WF}/merge-gate.yml@{sha}",
+        "    with:",
+        f"      gate-ref: {sha}",
+    ]) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("repo_dir")
@@ -73,9 +105,18 @@ def main() -> int:
     ap.add_argument("--python", action="append", default=[])
     ap.add_argument("--no-secret-scan", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--merge-gate", action="store_true", help="write merge-gate.yml (the merge gate caller) instead")
     a = ap.parse_args()
     if not re.fullmatch(r"[0-9a-f]{40}", a.sha):
         raise SystemExit("--sha must be a full 40-character commit SHA")
+    if a.merge_gate:
+        dest = Path(a.repo_dir) / ".github" / "workflows" / "merge-gate.yml"
+        if dest.exists() and not a.force:
+            raise SystemExit(f"{dest} exists; pass --force to overwrite")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(render_gate(a.branch, a.sha), encoding="utf-8", newline="\n")
+        print(dest)
+        return 0
     if not (a.node or a.python):
         raise SystemExit("at least one --node or --python job is required")
     jobs = [(n, "reusable-node-ci.yml", i) for n, i in (job("node", s) for s in a.node)]

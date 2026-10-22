@@ -1,0 +1,27 @@
+# Packaging for the merge gate only, so pre-commit can install it from this repo
+# (.pre-commit-hooks.yaml). The workflows need none of this. Standard library only: no dependencies.
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saluca-merge-gate"
+version = "0.1.0"
+description = "The estate merge gate: the checks behind merge-gate.yml, runnable before a push"
+requires-python = ">=3.11"
+license = "MIT"
+
+[project.scripts]
+saluca-gate = "gate.cli:main"
+
+[tool.setuptools]
+packages = ["gate", "gate.checks", "gate_workflows"]
+
+[tool.setuptools.package-dir]
+# repo-docs.yml ships inside the wheel from its real location, so the docs check extracts the
+# same inline block the workflow runs (no copy, no drift).
+gate_workflows = ".github/workflows"
+
+[tool.setuptools.package-data]
+gate = ["gitleaks.toml"]
+gate_workflows = ["repo-docs.yml"]

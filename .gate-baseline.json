@@ -1,0 +1,13 @@
+{
+ "version": 1,
+ "written": "2026-10-22",
+ "rule": "debt may only shrink; see repo-merge-gate.md GATE-3",
+ "entries": [
+  {
+   "check": "branch-protection",
+   "key": "unprotected",
+   "path": "",
+   "message": "CI-6: salucallc/ci-shared@main is not protected: anyone with write access can push to it directly"
+  }
+ ]
+}
