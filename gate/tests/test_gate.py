@@ -168,6 +168,23 @@ class Secrets(Base):
         self.assertPasses(dict(CLEAN_PY, **{".env.example": "SOULAUTH_JWT_PRIVATE_KEY_PATH=./keys/private.pem\n"}), "secrets",
                           env=self.env)
 
+    def test_env_template_empty_value_with_inline_comment_passes(self):
+        # tiresias-web .env.example, 2026-10-22: the value is empty; ' # ...' is a dotenv inline comment
+        line = "WORKOS_COOKIE_PASSWORD=  # min 32 chars, generate with: openssl rand -hex 32\n"
+        self.assertPasses(dict(CLEAN_PY, **{".env.example": line}), "secrets", env=self.env)
+
+    def test_env_template_value_with_inline_comment_fails(self):
+        line = f"WORKOS_COOKIE_PASSWORD={rnd(32)}  # min 32 chars\n"
+        self.assertFails(dict(CLEAN_PY, **{".env.example": line}), "secrets", "WORKOS_COOKIE_PASSWORD in an env template",
+                         env=self.env)
+
+    def test_env_template_hash_inside_value_is_a_value(self):
+        # no whitespace before '#', or inside quotes: part of the value, not a comment
+        for line in (f"APP_SECRET={rnd(12)}#{rnd(12)}\n", f'APP_SECRET="{rnd(12)} #{rnd(12)}"\n'):
+            with self.subTest(line=line[:12]):
+                self.assertFails(dict(CLEAN_PY, **{".env.example": line}), "secrets", "APP_SECRET in an env template",
+                                 env=self.env)
+
     def test_committed_env_file_fails(self):
         self.assertFails(dict(CLEAN_PY, **{".env": "DEBUG=1\n"}), "secrets", "secrets file committed", env=self.env)
 

@@ -128,6 +128,18 @@ def run_gitleaks(repo: Repo, r: Result, staged: bool = False) -> None:
 
 # ---------------------------------------------------------------- the stdlib sweep
 
+def env_value(raw: str) -> str:
+    """The value of a dotenv line, given everything after '='. As dotenv (Node) reads it: a quoted value is
+    the text inside the quotes ('#' included); unquoted, whitespace then '#' starts a comment, so
+    `KEY=  # note` is empty, while `KEY=a#b` keeps its '#'."""
+    s = raw.strip()
+    if s[:1] in ("'", '"'):
+        end = s.find(s[0], 1)
+        return s[1:end] if end > 0 else s[1:]
+    m = re.search(r"\s#", raw)
+    return (raw[:m.start()] if m else raw).strip()
+
+
 def judge_text(path: str, text: str, where: str):
     """Yield (rule, line, fp, message) for one file's text. Pure: no repo access."""
     name = PurePosixPath(path).name
@@ -161,10 +173,10 @@ def judge_text(path: str, text: str, where: str):
     # .env templates: secret-shaped keys must hold placeholders
     if ENV_TEMPLATE.search(path) or name.startswith(".env"):
         for n, line in enumerate(text.splitlines(), 1):
-            m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", line)
+            m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", line)
             if not m or not SECRETISH_KEY.search(m.group(1)) or NOT_A_VALUE_KEY.search(m.group(1)):
                 continue
-            val = m.group(2).split(" #")[0].strip().strip("'\"")
+            val = env_value(m.group(2))
             if len(val) < 8 or is_placeholder(val) or val.startswith(("$", "<", "{")) or "${" in val:
                 continue
             if "://" in val:
