@@ -50,6 +50,11 @@ class GateRepo:
     def _git(self, *args):
         subprocess.run(["git", *GIT_ID, "-C", str(self.path), *args], check=True, capture_output=True)
 
+    def _out(self, *args) -> str:
+        """stdout of a git command, for the tests that need a sha rather than a side effect."""
+        return subprocess.run(["git", *GIT_ID, "-C", str(self.path), *args], check=True,
+                              capture_output=True, text=True, encoding="utf-8").stdout.strip()
+
     def write(self, files):
         for rel, content in files.items():
             p = self.path / rel
@@ -427,6 +432,82 @@ class SecretsScope(Base):
         r.commit("baseline")
         code, out, data = self.scoped(r, "--base-ref", "base")
         self.assertEqual(code, 1, out)
+
+
+class SecretsScopeHelpers(Base):
+    """The scope helpers directly, not through the CLI. The mutation smoke found three mutants of
+    secrets_scope.py that survived the CLI tests (a deleted path let through, a merge commit's shared
+    paths emptied, a path-less object line turned into an empty path); each test below is the case
+    that catches one."""
+
+    def repo(self, files: dict) -> GateRepo:
+        r = GateRepo(files)
+        self.addCleanup(r.close)
+        return r
+
+    def core(self, r: GateRepo):
+        from gate.core import Repo
+        return Repo(r.path)
+
+    def test_changed_blobs_skips_deletions_and_non_regular_files(self):
+        """A deleted path is not a changed blob, and neither is a symlink (mode 120000). The mutant
+        turns the skip into `status.startswith('D') and not mode.startswith('100')`, which lets a
+        deletion through carrying its old blob. The symlink goes in through the index
+        (`--cacheinfo 120000,...`) so the test does not need symlink privileges on Windows."""
+        r = self.repo({"keep.py": "A = 1\n", "gone.py": "B = 2\n"})
+        base = r._out("rev-parse", "HEAD")
+        (r.path / "_blob.txt").write_text("keep.py\n", encoding="utf-8", newline="\n")
+        link_blob = r._out("hash-object", "-w", "_blob.txt")
+        r._git("rm", "-q", "gone.py")
+        r._git("update-index", "--add", "--cacheinfo", f"120000,{link_blob},link.txt")
+        (r.path / "keep.py").write_text("A = 3\n", encoding="utf-8", newline="\n")
+        r._git("add", "keep.py")
+        r._git("commit", "-q", "-m", "delete one, symlink another")
+        from gate.checks.secrets_scope import changed_blobs
+        got = changed_blobs(self.core(r), base, "HEAD")
+        self.assertEqual(set(got), {"keep.py"}, got)
+
+    def test_commit_changes_of_a_merge_is_the_paths_every_parent_shares(self):
+        """A merge commit introduces only what differs from every parent. The mutant flips `k in d`
+        to `k not in d`, which makes a path introduced in one parent and not the other count as the
+        merge's own change."""
+        r = self.repo({"base.py": "X = 1\n"})
+        r._git("checkout", "-q", "-b", "left")
+        (r.path / "left.py").write_text("L = 1\n", encoding="utf-8", newline="\n")
+        r.commit("left adds left.py")
+        r._git("checkout", "-q", "main")
+        r._git("checkout", "-q", "-b", "right")
+        (r.path / "right.py").write_text("R = 1\n", encoding="utf-8", newline="\n")
+        r.commit("right adds right.py")
+        r._git("merge", "-q", "--no-ff", "-m", "merge left and right", "left")
+        from gate.checks.secrets_scope import commit_changes
+        ps, common = commit_changes(self.core(r), "HEAD")
+        self.assertEqual(len(ps), 2, ps)
+        self.assertEqual(common, {}, f"paths added on one side only are not the merge's own change: {common}")
+
+    def test_commit_changes_of_an_ordinary_commit_is_everything_it_touches(self):
+        """The same helper on a non-merge: with one parent, every path it changes is its own change.
+        (A merge-only test would pass with the mutant if that helper always returned {}.)"""
+        r = self.repo({"base.py": "X = 1\n"})
+        (r.path / "added.py").write_text("A = 1\n", encoding="utf-8", newline="\n")
+        r.commit("add one file")
+        from gate.checks.secrets_scope import commit_changes
+        ps, common = commit_changes(self.core(r), "HEAD")
+        self.assertEqual(len(ps), 1, ps)
+        self.assertEqual(set(common), {"added.py"}, common)
+
+    def test_reachable_blobs_maps_only_paths_and_never_an_empty_one(self):
+        """`rev-list --objects` also lists commits and trees, which have no path. The mutant turns
+        `path and sha not in out` into `path or ...`, so those lines land in the map under an empty
+        path, and a caller comparing blob shas then matches nothing useful."""
+        r = self.repo({"a.py": "A = 1\n", "copy.py": "A = 1\n"})
+        from gate.checks.secrets_scope import reachable_blobs
+        got = reachable_blobs(self.core(r), "HEAD")
+        self.assertTrue(got, got)
+        self.assertTrue(all(p for p in got.values()), f"an object with no path reached the map: {got}")
+        self.assertIn("a.py", got.values())
+        same = [p for p in got.values() if p in {"a.py", "copy.py"}]
+        self.assertEqual(len(same), 1, f"one blob sha is one entry, even at two paths: {got}")
 
 
 def _git_exe() -> str:
