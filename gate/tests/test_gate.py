@@ -455,7 +455,9 @@ class Licence(Base):
 
     def test_recent_change_with_dated_note_passes(self):
         readme = CLEAN_PY["README.md"].replace("MIT", "Apache-2.0")
-        note = "# Changelog\n\n- 2026-10-22: licence changed from MIT to Apache-2.0 (approved by the owner).\n"
+        # dated on or after the licence-change commit, which the fixture makes today (a fixed date failed after midnight UTC)
+        today = __import__("datetime").date.today().isoformat()
+        note = f"# Changelog\n\n- {today}: licence changed from MIT to Apache-2.0 (approved by the owner).\n"
         self.assertPasses(CLEAN_PY, "licence", extra=[{"LICENSE": APACHE, "README.md": readme, "CHANGELOG.md": note}])
 
     def test_readme_paper_doi_is_not_the_code_record(self):
