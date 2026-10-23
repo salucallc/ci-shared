@@ -24,7 +24,9 @@ from ..core import BLOCK, WARN, Repo, Result
 
 FILE_RE = re.compile(r"(?i)^(licen[cs]e|copying|unlicense)([.-][\w.-]*)?$")
 SIGNATURES = [  # order matters: the more specific text first
-    # FSL first: its text quotes the Apache or MIT licence it converts to
+    # BUSL and FSL first: their text names the Apache, MIT or GPL licence they convert to
+    ("BUSL-1.1", [r"Business Source License,? (Version )?1\.1"]),
+    ("BUSL-1.1", [r"(?m)^\s*Change Date:", r"(?m)^\s*Change License:", r"(?m)^\s*Licensed Work:"]),  # its parameter block
     ("FSL-1.1-ALv2", [r"Functional Source License,? Version 1\.1", r"Apache (License,? Version )?2\.0 Future License"]),
     ("FSL-1.1-MIT", [r"Functional Source License,? Version 1\.1", r"MIT Future License"]),
     ("AGPL-3.0", [r"GNU AFFERO GENERAL PUBLIC LICENSE"]),
@@ -34,7 +36,6 @@ SIGNATURES = [  # order matters: the more specific text first
     ("GPL-2.0", [r"GNU GENERAL PUBLIC LICENSE", r"Version 2"]),
     ("Apache-2.0", [r"Apache License", r"Version 2\.0"]),
     ("MPL-2.0", [r"Mozilla Public License,? (Version|v\.?) ?2\.0"]),
-    ("BUSL-1.1", [r"Business Source License 1\.1"]),
     ("Elastic-2.0", [r"Elastic License 2\.0"]),
     ("PolyForm-Noncommercial-1.0.0", [r"PolyForm Noncommercial License 1\.0\.0"]),
     ("PolyForm-Small-Business-1.0.0", [r"PolyForm Small Business License 1\.0\.0"]),
@@ -76,8 +77,10 @@ MENTION = re.compile(r"(?i)\b(MIT|Apache[- ]?(License,? )?(Version )?2(\.0)?|BSD
 
 def mentioned(text: str) -> set[str]:
     """SPDX ids a prose section names. An FSL licence names its future licence (Apache 2.0 or MIT)
-    in the same breath; that is part of FSL, not a second licence."""
-    ids = {canon(m.group(0)) for m in MENTION.finditer(text)} - {None}
+    in the same breath; that is part of FSL, not a second licence. So is the licence a BUSL text names
+    right after 'Change License'."""
+    ids = {canon(m.group(0)) for m in MENTION.finditer(text)
+           if not re.search(r"(?i)change licen[cs]e:?\s*$", text[max(0, m.start() - 20):m.start()])} - {None}
     if re.search(r"(?i)functional source license|\bFSL-1\.1", text):
         ids.add("FSL-1.1-MIT" if re.search(r"(?i)MIT Future License|FSL-1\.1-MIT", text) else "FSL-1.1-ALv2")
         ids -= {"Apache-2.0", "MIT"}

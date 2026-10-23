@@ -490,6 +490,25 @@ class Licence(Base):
         self.assertPasses(dict(CLEAN_PY, **{"README.md": readme, "LICENSES/CC-BY-4.0.txt": "Attribution 4.0 International\n"}),
                           "licence", allow=("pass",))
 
+    def test_busl_file_is_not_read_as_its_change_licence(self):
+        # tiresias, 2026-10-22: a BUSL-1.1 LICENSE names "Change License: Apache License, Version 2.0".
+        # Fixtures: SPDX license-list-data text/BUSL-1.1.txt (with the template's Parameters block filled in)
+        # and text/Apache-2.0.txt
+        sys.path.insert(0, str(ROOT))
+        from gate.checks import licence
+        fx = Path(__file__).resolve().parent / "fixtures"
+        busl = (fx / "BUSL-1.1.txt").read_text(encoding="utf-8")
+        self.assertEqual(licence.identify(busl), "BUSL-1.1")
+        self.assertEqual(licence.identify(busl.split("\n", 1)[1]), "BUSL-1.1")  # header line lost: the parameter block
+        self.assertEqual(licence.identify((fx / "Apache-2.0.txt").read_text(encoding="utf-8")), "Apache-2.0")
+        fsl = "# Functional Source License, Version 1.1, Apache 2.0 Future License\n\n... Apache License, Version 2.0 ...\n"
+        self.assertEqual(licence.identify(fsl), "FSL-1.1-ALv2")
+        readme = CLEAN_PY["README.md"].replace("MIT, see LICENSE.", "BUSL-1.1, see LICENSE. Change License Apache-2.0 on 2030-01-01.")
+        self.assertPasses(dict(CLEAN_PY, **{"LICENSE": busl, "README.md": readme}), "licence", allow=("pass",))
+        # another licence named outside the Change License is still a mismatch
+        self.assertFails(dict(CLEAN_PY, **{"LICENSE": busl, "README.md": readme.replace("2030-01-01.", "2030-01-01. The sdk is MIT.")}),
+                         "licence", "README.md License section says MIT")
+
     def test_consistent_passes(self):
         files = dict(CLEAN_PY, **{"package.json": json.dumps({"name": "demo", "license": "MIT"})})
         self.assertPasses(files, "licence", allow=("pass",))
