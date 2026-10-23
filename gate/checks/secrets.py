@@ -24,6 +24,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 from ..core import BLOCK, Repo, Result, fp12, is_placeholder, line_of, shannon
+from . import secrets_scope as scope
 
 GITLEAKS_VERSION = "8.30.1"
 HERE = Path(__file__).resolve().parent.parent
@@ -44,6 +45,8 @@ NOT_A_VALUE_KEY = re.compile(r"(?i)_(path|file|dir|filename|name|id|url_?base|al
                              r"expiry|length|len|header|prefix|enabled|required|mode|type|version)$")
 K8S_KIND = re.compile(r"(?m)^kind:\s*Secret\s*$")
 PEM_PRIVATE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+PRE_EXISTING = "pre-existing"  # a Finding state: found, outside the change, reported, not blocking (SEC-4)
+SKIP_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".woff2")
 
 
 def gitleaks_binary() -> tuple[str | None, str]:
@@ -90,7 +93,11 @@ def ignore_file_problems(repo: Repo, r: Result) -> None:
                   "comment line above it", ".gitleaksignore", n, key=f"ignore-noreason|{s}")
 
 
-def run_gitleaks(repo: Repo, r: Result, staged: bool = False) -> None:
+def run_gitleaks(repo: Repo, r: Result, staged: bool = False, change: set[str] | None = None,
+                 label: str = "") -> None:
+    """change None: every finding blocks (staged, or --whole-repo). Otherwise a finding blocks only when its
+    commit is in the change. gitleaks reads each commit's ADDED lines, so a touched line is a hit in the
+    commit that touched it. The rest are pre-existing: reported by fingerprint, not blocking (SEC-4)."""
     exe, why = gitleaks_binary()
     if not exe:
         r.cannot(why)
@@ -119,8 +126,17 @@ def run_gitleaks(repo: Repo, r: Result, staged: bool = False) -> None:
     r.notes.append(f"gitleaks {GITLEAKS_VERSION}, estate config, {'staged changes' if staged else 'all refs, full history'}: {len(rows)} finding(s)")
     for row in rows:
         fpr = row.get("Fingerprint", "")
-        commit = (row.get("Commit") or "")[:10]
-        r.add(BLOCK, f"SEC-1: gitleaks rule {row.get('RuleID')} at commit {commit or 'staged'}"
+        full = row.get("Commit") or ""
+        commit = full[:10]
+        if change is not None and full not in change:
+            f = r.add(BLOCK, f"SEC-1: pre-existing secret, gitleaks rule {row.get('RuleID')} at commit {commit} "
+                      f"(fingerprint {fpr}), outside this change ({label}..HEAD). Not blocking this push: list it in "
+                      "the PR body by fingerprint, and treat it as an incident (rotate first)",
+                      row.get("File", ""), int(row.get("StartLine") or 0), key=f"gitleaks|{fpr}")
+            f.state = PRE_EXISTING
+            continue
+        scope_note = f" in this change ({label}..HEAD)" if change is not None else ""
+        r.add(BLOCK, f"SEC-1: gitleaks rule {row.get('RuleID')} at commit {commit or 'staged'}{scope_note}"
               f" (fingerprint {fpr}). If it is a reviewed fixture, add the fingerprint to .gitleaksignore "
               f"under a comment saying why; if it is real, stop: a secret in history is an incident, not a fix",
               row.get("File", ""), int(row.get("StartLine") or 0), key=f"gitleaks|{fpr}")
@@ -233,6 +249,32 @@ def sweep_tree(repo: Repo, r: Result, files: list[str] | None = None) -> None:
             r.add(BLOCK, f"{msg} [fp12 {f}]", rel, ln, key=f"tree|{rule}|{rel}|{f}")
 
 
+def read_blobs(repo: Repo, wanted: dict[str, str]):
+    """Yield (sha, path, text) for each text blob in {sha: path}; binaries and blobs over 2 MB are skipped."""
+    wanted = {sha: p for sha, p in wanted.items() if PurePosixPath(p).suffix.lower() not in SKIP_SUFFIXES}
+    if not wanted:
+        return
+    proc = subprocess.Popen(["git", "-C", str(repo.root), "cat-file", "--batch"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+    assert proc.stdin and proc.stdout
+    try:
+        for sha, path in wanted.items():
+            proc.stdin.write((sha + "\n").encode())
+            proc.stdin.flush()
+            header = proc.stdout.readline().split()
+            if len(header) < 3:
+                continue
+            size = int(header[2])
+            data = proc.stdout.read(size)
+            proc.stdout.read(1)
+            if header[1] != b"blob" or size > 2_000_000 or b"\0" in data[:8192]:
+                continue
+            yield sha, path, data.decode("utf-8", "replace")
+    finally:
+        proc.stdin.close()
+        proc.wait()
+
+
 def sweep_history(repo: Repo, r: Result) -> None:
     """Every blob reachable from any ref, once. HEAD-tree hits are already reported by sweep_tree."""
     try:
@@ -252,35 +294,105 @@ def sweep_history(repo: Repo, r: Result) -> None:
     for line in listing.splitlines():
         sha, _, path = line.partition(" ")
         if path and sha not in wanted and sha not in head_blobs:
-            if PurePosixPath(path).suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".woff2"):
-                continue
             wanted[sha] = path
     if not wanted:
         r.notes.append("history sweep: no blobs outside the HEAD tree")
         return
-    proc = subprocess.Popen(["git", "-C", str(repo.root), "cat-file", "--batch"], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE)
-    assert proc.stdin and proc.stdout
     n_scanned = 0
-    for sha, path in wanted.items():
-        proc.stdin.write((sha + "\n").encode())
-        proc.stdin.flush()
-        header = proc.stdout.readline().split()
-        if len(header) < 3:
-            continue
-        size = int(header[2])
-        data = proc.stdout.read(size)
-        proc.stdout.read(1)
-        if header[1] != b"blob" or size > 2_000_000 or b"\0" in data[:8192]:
-            continue
+    for sha, path, text in read_blobs(repo, wanted):
         n_scanned += 1
-        text = data.decode("utf-8", "replace")
         for rule, ln, f, msg in judge_text(path, text, "history"):
             r.add(BLOCK, f"{msg} [in history only, blob {sha[:10]}; fp12 {f}]. A secret in history is an incident: "
                   "rotate first, then decide on a history rewrite", path, ln, key=f"hist|{rule}|{path}|{f}")
-    proc.stdin.close()
-    proc.wait()
     r.notes.append(f"history sweep: {n_scanned} blob(s) outside HEAD scanned")
+
+
+def tree_blobs(repo: Repo, rev: str) -> dict[str, str]:
+    """{blob sha: path} of one commit's tree (regular files only)."""
+    out: dict[str, str] = {}
+    try:
+        raw = repo.git("ls-tree", "-r", "-z", rev)
+    except RuntimeError as e:
+        raise scope.CannotTell(str(e)) from e
+    for entry in raw.split("\0"):
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) >= 3 and parts[1] == "blob" and parts[0].startswith("100"):
+            out.setdefault(parts[2], path)
+    return out
+
+
+def sweep_change(repo: Repo, r: Result, opts) -> tuple[set[str], str]:
+    """The stdlib sweep scoped to base..HEAD plus the working tree (SEC-4; the rules are in secrets_scope).
+    Returns (the range's commits, the base label) for gitleaks. Raises scope.CannotTell."""
+    base, label = scope.resolve_base(repo, getattr(opts, "base_ref", None))
+    commits = scope.range_commits(repo, base)
+    no_history = getattr(opts, "no_history", False)
+    r.notes.append(f"change: merge-base of {label} and HEAD ({base[:10]}), {len(commits)} commit(s) in range, plus "
+                   "the working tree. A secret the change adds or touches blocks; one already there is reported")
+
+    # what was already there: every blob reachable from base (its tree only, under --no-history)
+    base_blobs = tree_blobs(repo, base) if no_history else scope.reachable_blobs(repo, base)
+    base_fps: set[tuple[str, str]] = set()
+    pre: dict[tuple[str, str, str], tuple[str, int, str]] = {}
+    for sha, path, text in read_blobs(repo, base_blobs):
+        for rule, ln, f, msg in judge_text(path, text, "history"):
+            base_fps.add((rule, f))
+            pre.setdefault((rule, path, f), (msg, ln, f"at {label}, blob {sha[:10]}"))
+
+    blocked: set[tuple[str, str, str]] = set()
+
+    def hit(rule: str, path: str, ln: int, f: str, msg: str, where: str) -> None:
+        if (rule, path, f) in blocked:
+            return
+        blocked.add((rule, path, f))
+        r.add(BLOCK, f"{msg} [this change: {where}; fp12 {f}]. Remove it before pushing; if it was ever real, it "
+              "is an incident: rotate first", path, ln, key=f"change|{rule}|{path}|{f}")
+
+    # every commit in the range, history-only ones included
+    if not no_history:
+        for c in commits:
+            ps, changed = scope.commit_changes(repo, c)
+            for sha, path, text in read_blobs(repo, {b: p for p, b in changed.items()}):
+                hits = list(judge_text(path, text, "history"))
+                if not hits:
+                    continue
+                added = scope.added_in_commit(repo, ps, c, path)
+                for rule, ln, f, msg in hits:
+                    if scope.blocks(rule, f, ln, added, base_fps):
+                        hit(rule, path, ln, f, msg, f"commit {c[:10]}")
+
+    # the working tree (and the index) against base
+    for rel in scope.tree_changes(repo, base):
+        text = repo.text(rel)
+        if text is None:
+            if repo.exists(rel) and SECRET_FILE_NAMES.search(rel) and not ENV_TEMPLATE.search(rel):
+                hit("SEC-3", rel, 1, fp12(rel), "SEC-3: binary secrets file committed (keystore or certificate bundle)",
+                    f"working tree against {label}")
+            continue
+        hits = list(judge_text(rel, text, "tree"))
+        if not hits:
+            continue
+        added = scope.added_lines(repo, base, None, rel)
+        for rule, ln, f, msg in hits:
+            if scope.blocks(rule, f, ln, added, base_fps):
+                hit(rule, rel, ln, f, msg, f"working tree against {label}")
+
+    # other refs (stale branches, refs/pull/*): never this change, always reported
+    if not no_history:
+        other = scope.reachable_blobs(repo, "--all", "--not", "HEAD", base)
+        for sha, path, text in read_blobs(repo, {b: p for b, p in other.items() if b not in base_blobs}):
+            for rule, ln, f, msg in judge_text(path, text, "history"):
+                pre.setdefault((rule, path, f), (msg, ln, f"on another ref, blob {sha[:10]}"))
+
+    for (rule, path, f), (msg, ln, where) in pre.items():
+        if (rule, path, f) in blocked:
+            continue
+        fnd = r.add(BLOCK, f"{msg} [pre-existing: {where}; fp12 {f}]. Not blocking this push: list it in the PR "
+                    "body by fingerprint, and treat it as an incident (rotate first)", path, ln,
+                    key=f"pre|{rule}|{path}|{f}")
+        fnd.state = PRE_EXISTING
+    return set(commits), label
 
 
 def run(repo: Repo, opts) -> Result:
@@ -291,8 +403,20 @@ def run(repo: Repo, opts) -> Result:
         if getattr(opts, "staged", False):
             run_gitleaks(repo, r, staged=True)
         return r
-    sweep_tree(repo, r)
-    if not getattr(opts, "no_history", False):
-        sweep_history(repo, r)
-    run_gitleaks(repo, r)
+    if getattr(opts, "whole_repo", False):
+        r.notes.append("--whole-repo: every commit of every ref is the change, so every finding blocks")
+        sweep_tree(repo, r)
+        if not getattr(opts, "no_history", False):
+            sweep_history(repo, r)
+        run_gitleaks(repo, r)
+        return r
+    try:
+        change, label = sweep_change(repo, r, opts)
+    except scope.CannotTell as e:
+        return r.cannot(f"cannot tell the change from what was already there: {e}")
+    run_gitleaks(repo, r, change=change, label=label)
+    pre = sum(1 for f in r.findings if f.state == PRE_EXISTING)
+    if pre:
+        r.notes.append(f"{pre} pre-existing secret finding(s) outside this change: not blocking, listed by "
+                       "fingerprint below; name them in the PR body (repo-merge-gate.md SEC-4)")
     return r

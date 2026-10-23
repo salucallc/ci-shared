@@ -142,6 +142,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CHECK: ${{ matrix.check }}
           BASE_REF: ${{ github.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT: ${{ github.event_name }}
+          PUSHED_REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
           VISIBILITY: ${{ github.event.repository.visibility }}
           SLUG: ${{ github.repository }}
         run: |
@@ -149,7 +153,17 @@ jobs:
           # This step's whole log is gate output: no command here may pass on failure.
           git config --global --add safe.directory "$PWD"
           args=(run --repo . --only "$CHECK" --deep --repo-slug "$SLUG" --json "${RUNNER_TEMP}/gate-${CHECK}.json")
-          if [ -n "$BASE_REF" ]; then args+=(--base-ref "origin/${BASE_REF}"); fi
+          # The change the secrets check judges (repo-merge-gate.md SEC-4): a PR against its base; a push to
+          # the default branch against the commit it replaced; anything else against the default branch.
+          # A base that does not resolve is cannot tell (exit 2), never a pass.
+          if [ -n "$BASE_REF" ]; then
+            args+=(--base-ref "origin/${BASE_REF}")
+          elif [ "$EVENT" = "push" ] && [ "$PUSHED_REF" = "refs/heads/${DEFAULT_BRANCH}" ] && [ -n "$BEFORE" ] \
+               && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            args+=(--base-ref "$BEFORE")
+          elif [ -n "$DEFAULT_BRANCH" ]; then
+            args+=(--base-ref "origin/${DEFAULT_BRANCH}")
+          fi
           if [ "$VISIBILITY" = "private" ] || [ "$VISIBILITY" = "public" ]; then args+=(--visibility "$VISIBILITY"); fi
           python -m gate "${args[@]}"
 
