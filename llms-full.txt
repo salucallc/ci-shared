@@ -168,7 +168,7 @@ It fails when:
 - `README.md` is missing, has no H1, lacks a required `## ` heading (prefix match, case-insensitive), or lacks a `_Last updated: YYYY-MM-DD_` line. The default headings are `Status,Install,Quickstart,Usage,Citation,License,Links`.
 - `llms.txt` is missing or not in [llmstxt.org](https://llmstxt.org) shape: an H1 first, a `> ` summary within the next three non-blank lines, at least one `## ` section and at least one `- [name](url)` link.
 - `README.md`, `llms.txt` or `AGENTS.md` contains an em-dash (U+2014), unless `check-em-dash: false`.
-- gitleaks finds a secret anywhere in git history, unless `run-gitleaks: false`. gitleaks 8.30.1 runs from its release binary after a SHA-256 check, not through `gitleaks-action`, which needs a paid licence key for organisation accounts. Reviewed false positives go in the calling repo's `.gitleaksignore`, one fingerprint per line, with a comment saying why.
+- gitleaks finds a secret anywhere in git history, unless `run-gitleaks: false`. gitleaks 8.30.1 runs from its release binary after a SHA-256 check, not through `gitleaks-action`, which needs a paid licence key for organisation accounts. Reviewed false positives go in the calling repo's `.gitleaksignore`, one fingerprint per line, with a comment saying why. That file is excluded from the scan (path allowlist in `gate/gitleaks.toml`), because explaining a false positive means quoting the shape being dismissed, and the gate must not block on the remedy file it prescribes. An entry with no reason above it is still a block.
 
 A data-only repo can narrow the headings:
 

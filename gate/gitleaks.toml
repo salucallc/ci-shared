@@ -19,6 +19,30 @@ useDefault = true
 # history blob, so it replaces this rule rather than duplicating it.
 disabledRules = ["kubernetes-secret-yaml"]
 
+# THE REMEDY FILE CANNOT BE THE FINDING. `.gitleaksignore` is what this gate's own SEC-1 message
+# tells you to write ("add the fingerprint to .gitleaksignore under a comment saying why"), and its
+# content is a list of findings by nature: a fingerprint ends in a rule name, and a repo that
+# explains a false positive will quote the shape it is dismissing, because that quotation IS the
+# review. Scanning the file therefore flags the explanation of a finding as a new finding.
+#
+# That is not hypothetical. saluca-campus's first .gitleaksignore quoted two camera-view records as
+# JSON to show that a view name is not a credential; the gate reported .gitleaksignore lines 9 and
+# 10 as `generic-api-key`, and the only repo-side escape - fingerprinting the file's own explanation
+# - mints a new matching line in the same file every time it is touched, so it recurses.
+#
+# So the path is excluded from the SCAN, not from review. The stdlib sweep (gate/checks/secrets.py)
+# still reads the file for the one thing a remedy file can get wrong on its own: an entry with no
+# reason above it is a BLOCK (`ignore_file_problems`). Nothing a secret scan is for is lost: the
+# gate never reads suppression entries, gitleaks does, and every other path in the tree and in
+# history is still scanned.
+#
+# Anchored at both ends and requiring the bare dot-name, so `.gitleaksignore.bak`, `old/gitleaksignore`
+# and `my.gitleaksignore.txt` are all still scanned.
+[allowlist]
+paths = [
+  '''(^|/)\.gitleaksignore$''',
+]
+
 [[rules]]
 id = "estate-telegram-bot-token"
 description = "Telegram bot token shape, any variable name (from life-os)"

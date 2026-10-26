@@ -192,6 +192,29 @@ class Secrets(Base):
         self.assertFails(dict(CLEAN_PY, **{".gitleaksignore": "abc123:src/x.py:generic-api-key:3\n"}), "secrets",
                          ".gitleaksignore entry with no reason", env=self.env)
 
+    def test_secret_shaped_text_in_gitleaksignore_passes(self):
+        # The remedy file SEC-1 prescribes must not itself be a finding. saluca-campus, 2026-10-26:
+        # a reviewed false positive was explained by quoting the JSON the rule matched, and the gate
+        # reported .gitleaksignore:9 and :10 as `generic-api-key`. A repo-side fingerprint for that
+        # mints a new matching line in the same file, so it recurses: the path is allowlisted in
+        # gate/gitleaks.toml instead. The canary here is the strongest case - a shape NO rule can
+        # mistake for prose - and the pass is what proves the path allowlist reaches gitleaks.
+        canary = "SALUCA_GATE_" + "CANARY_" + rnd(28)
+        text = ("# the canary quoted below is a reviewed test fixture, not a credential\n"
+                f"# {canary}\n"
+                "abc123:src/x.py:generic-api-key:3\n")
+        self.assertPasses(dict(CLEAN_PY, **{".gitleaksignore": text}), "secrets", env=self.env)
+
+    def test_secret_shaped_text_beside_gitleaksignore_still_fails(self):
+        # The positive control for the allowlist, and the reason its regex is anchored at both ends:
+        # a file that merely LOOKS like the remedy file must still be scanned, or the allowlist is a
+        # hole a secret can be parked in. Same canary, one directory deep and one suffix off.
+        canary = "SALUCA_GATE_" + "CANARY_" + rnd(28)
+        for path in ("notes/.gitleaksignore.bak", "old/gitleaksignore"):
+            with self.subTest(path=path):
+                self.assertFails(dict(CLEAN_PY, **{path: f"TOKEN = '{canary}'\n"}), "secrets",
+                                 "estate-gate-canary", env=self.env)
+
     def test_missing_gitleaks_is_cannot_tell(self):
         home = tempfile.mkdtemp(prefix="repogate-home-")
         env = {"GATE_GITLEAKS": str(Path(home) / "nope"), "HOME": home, "USERPROFILE": home,
