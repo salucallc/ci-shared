@@ -786,6 +786,48 @@ class GateConfig(Base):
         code, out, _ = repo.gate("--only", "paths", "--offline")
         self.assertEqual(code, 0, out)
 
+    def test_a_check_that_did_not_run_cannot_call_an_entry_fixed(self):
+        """THE FOURTEEN FALSE WARNINGS.
+
+        merge-gate.yml gives every check its own job and runs `--only <check>`, so the
+        findings in a baseline that belong to other checks are never loaded. Treating
+        them as "fixed" told every consumer repo, on every run, that debt it still owed
+        had been paid. The twin below is the case the warning exists for.
+        """
+        repo = GateRepo(dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\n'}))
+        self.addCleanup(repo.close)
+        subprocess.run([sys.executable, "-m", "gate", "baseline", "--repo", str(repo.path), "--only", "paths",
+                        "--offline"], cwd=ROOT, check=True, capture_output=True)
+        repo.commit("baseline")
+        code, out, _ = repo.gate("--only", "control-chars", "--offline")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("fixed", out)
+
+    def test_a_check_that_did_run_reports_its_debt_as_paid(self):
+        """ANTI-VACUITY for the rule above: the warning must still fire for the one check
+        that ran, or scoping it to the checks that ran would have silenced it entirely."""
+        repo = GateRepo(dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\n'}))
+        self.addCleanup(repo.close)
+        subprocess.run([sys.executable, "-m", "gate", "baseline", "--repo", str(repo.path), "--only", "paths",
+                        "--offline"], cwd=ROOT, check=True, capture_output=True)
+        repo.commit("baseline")
+        repo.write({"src/io.py": "P = 'relative/path'\n"})
+        repo.commit("fix it")
+        code, out, _ = repo.gate("--only", "paths", "--offline")
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 baseline entry is fixed", out)
+
+    def test_baseline_writes_one_entry_per_finding(self):
+        """A finding's id is a hash of check|path|message, so the same defect written
+        twice in one file hashes the same. The file used to carry it twice: the second
+        copy was debt nothing could ever pay off, and it inflated every count."""
+        repo = GateRepo(dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\nQ = "D:/x/y"\n'}))
+        self.addCleanup(repo.close)
+        subprocess.run([sys.executable, "-m", "gate", "baseline", "--repo", str(repo.path), "--only", "paths",
+                        "--offline"], cwd=ROOT, check=True, capture_output=True)
+        entries = json.loads((repo.path / ".gate-baseline.json").read_text(encoding="utf-8"))["entries"]
+        self.assertEqual(len(entries), 1, entries)
+
     def test_baseline_absorbs_debt_and_may_only_shrink(self):
         files = dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\n'})
         repo = GateRepo(files)
