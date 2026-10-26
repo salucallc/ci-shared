@@ -288,6 +288,22 @@ class Style(Base):
     def test_signoff_is_allowed(self):
         self.assertPasses(dict(CLEAN_PY, **{"docs/post.md": "Text.\n\n" + chr(0x2014) + " Saluca Labs\n"}), "style", allow=("pass",))
 
+    def test_signoff_in_html_element_is_allowed(self):
+        # saluca-campus docs/_PDF/*.html, 2026-10-26: the sanctioned sign-off as its own element
+        for elem in ("<p>" + chr(0x2014) + " Saluca Labs</p>", '<p class="signoff">' + chr(0x2014) + " Saluca Labs</p>",
+                     "<footer><span>" + chr(0x2014) + " Saluca Labs</span></footer>"):
+            with self.subTest(elem=elem):
+                self.assertPasses(dict(CLEAN_PY, **{"docs/post.html": "<p>Text.</p>\n" + elem + "\n"}), "style",
+                                  allow=("pass",))
+
+    def test_em_dash_in_html_prose_fails(self):
+        # the HTML exception must not become an exemption for HTML: same element, more text, still fails
+        for line in ("<p>Fast " + chr(0x2014) + " and small.</p>",
+                     "<p>We build it " + chr(0x2014) + " Saluca Labs</p>",
+                     "<p>" + chr(0x2014) + " Saluca Labs</p><p>and then " + chr(0x2014) + " more</p>"):
+            with self.subTest(line=line):
+                self.assertFails(dict(CLEAN_PY, **{"docs/post.html": "<p>Text.</p>\n" + line + "\n"}), "style", "STY-1")
+
     def test_crlf_shell_script_fails(self):
         self.assertFails(dict(CLEAN_PY, **{"entrypoint.sh": b"#!/bin/sh\r\necho hi\r\n", ".gitattributes": "*.py text\n"}),
                          "style", "STY-3")
