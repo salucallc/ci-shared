@@ -2,7 +2,8 @@
 
 STY-1 covers every prose file (README, llms.txt, AGENTS.md, docs/, CHANGELOG, HTML), not only
 the three repo-docs.yml checks; merge-gate.yml calls repo-docs.yml with check-em-dash off so the
-check runs once. The single sanctioned exception is the "Saluca Labs" sign-off line.
+check runs once. The single sanctioned exception is the "Saluca Labs" sign-off, as a bare line or
+as an HTML element whose whole text content is the sign-off and nothing else.
 """
 from __future__ import annotations
 
@@ -12,7 +13,19 @@ from pathlib import PurePosixPath
 from ..core import BLOCK, PROSE_SUFFIXES, Repo, Result
 
 EM = "\u2014"
+# The sanctioned sign-off, matched against TEXT, not against source. Prose here includes HTML
+# (`PROSE_SUFFIXES`), where the sign-off is its own element - `<p>\u2014 Saluca Labs</p>`, measured in
+# saluca-campus `docs/_PDF/SALUCA-LABS-CAMPUS-DESIGN.html:1044` on 2026-10-26 - so the old
+# bare-line-only pattern called a correctly signed-off published page an em-dash violation. The
+# line is reduced to its text content and must then be nothing but the sign-off; an em-dash
+# anywhere else on the line still fails, which is the point of the check.
 SIGNOFF = re.compile(r"^\s*[*_]*\s*\u2014\s*Saluca Labs\s*[*_]*\s*$")
+TAG = re.compile(r"<[^>]*>")
+
+
+def is_signoff(line: str) -> bool:
+    """True only when the whole line is the sanctioned sign-off, as written or stripped of markup."""
+    return bool(SIGNOFF.match(line) or SIGNOFF.match(TAG.sub("", line)))
 LF_FILES = re.compile(r"(?i)(^|/)(Dockerfile[^/]*|[^/]*\.dockerfile|[^/]*\.sh|[^/]*\.bash|crontab[^/]*|[^/]*\.cron"
                       r"|[^/]*entrypoint[^/]*|cron\.d/[^/]+)$")
 
@@ -32,7 +45,7 @@ def run(repo: Repo, opts) -> Result:
         if text is None:
             continue
         for n, line in enumerate(text.splitlines(), 1):
-            if EM in line and not SIGNOFF.match(line):
+            if EM in line and not is_signoff(line):
                 r.add(BLOCK, "STY-1: em-dash in prose (house style: a hyphen in plain docs; in published prose "
                       "an ellipsis or a comma)", rel, n, key=f"{rel}|em|{line.strip()[:80]}")
     lf = [f for f in files if LF_FILES.search(f)]
