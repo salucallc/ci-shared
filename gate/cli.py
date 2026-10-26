@@ -171,7 +171,14 @@ def apply_baseline(repo: Repo, results: list[Result], cfg_result: Result, base_r
             if f.severity == BLOCK and f.state == "open" and (r.check, fid(f)) in entries:
                 f.state, f.note = "baselined", "pre-existing debt recorded in .gate-baseline.json"
                 used.add((r.check, fid(f)))
-    stale = entries - used
+    # ONLY A CHECK THAT RAN CAN SAY AN ENTRY IS FIXED. merge-gate.yml runs each check
+    # in its own job (`run --only <check>`), so `used` holds one check's findings and
+    # `entries - used` called every other check's debt "fixed" on every run. Found on
+    # the first consumer to adopt the gate with a baseline: fourteen jobs each reported
+    # the one check that had one. A warning that always fires is read as noise, and the
+    # run where it means something is then missed.
+    ran = {r.check for r in results} - NO_BASELINE
+    stale = {(c, i) for (c, i) in entries if c in ran} - used
     if stale:
         cfg_result.add(WARN, f"GATE-3: {len(stale)} baseline entr{'y is' if len(stale) == 1 else 'ies are'} fixed; "
                        "run `python -m gate baseline` to shrink the file", ".gate-baseline.json", key="stale")
@@ -339,9 +346,22 @@ def main(argv: list[str] | None = None) -> int:
         a.visibility = visibility(repo, a)
     results = run_checks(repo, names, a)
     if a.command == "baseline":
-        entries = [{"check": r.check, "id": fid(f), "path": f.path}
-                   for r in results if r.check not in NO_BASELINE for f in r.findings
-                   if f.severity == BLOCK and f.state == "open"]
+        # ONE ENTRY PER FINDING. The id is a hash of check|path|message, so the same
+        # defect written twice in one file hashes to the same id; it used to be
+        # written twice as well. Matching is by id, so the second copy is debt the
+        # file claims and nothing can ever pay off, and it inflated every count.
+        seen, entries = set(), []
+        for r in results:
+            if r.check in NO_BASELINE:
+                continue
+            for f in sorted(r.findings, key=lambda f: (f.path or "", f.ident())):
+                if f.severity != BLOCK or f.state != "open":
+                    continue
+                key = (r.check, fid(f))
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append({"check": r.check, "id": key[1], "path": f.path})
         baseline_path(repo).write_text(json.dumps({"version": 2, "written": today.isoformat(),
                                                    "rule": "debt may only shrink; see repo-merge-gate.md GATE-3",
                                                    "note": "ids are hashes of each finding; run `python -m gate run` to see them",
