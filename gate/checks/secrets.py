@@ -23,11 +23,12 @@ import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
 
-from ..core import BLOCK, Repo, Result, fp12, is_placeholder, line_of, shannon
+from ..core import BLOCK, WARN, Repo, Result, fp12, is_placeholder, line_of, shannon
 
 GITLEAKS_VERSION = "8.30.1"
 HERE = Path(__file__).resolve().parent.parent
 CONFIG = HERE / "gitleaks.toml"
+REVIEWED_FILE = ".secrets-reviewed"
 
 DSN_RE = re.compile(
     r"(?i)\b(postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver|clickhouse)"
@@ -88,6 +89,61 @@ def ignore_file_problems(repo: Repo, r: Result) -> None:
         elif not commented:
             r.add(BLOCK, "SEC-1: .gitleaksignore entry with no reason; put a '# why this is not a secret' "
                   "comment line above it", ".gitleaksignore", n, key=f"ignore-noreason|{s}")
+
+
+def read_secrets_reviewed(repo: Repo, r: Result) -> dict[tuple[str, str], int]:
+    """Parse `.secrets-reviewed`: `<fp12> <path>`, every entry under a comment saying why.
+
+    An entry silences exactly ONE SEC-2 HISTORY finding: one value, identified by `fp12` (the first
+    12 hex of SHA-256 of the value itself) at one path. It cannot name a rule, a directory, a glob
+    or a pattern, so there is no spelling of it that widens into a blanket exemption, and the value
+    hash means an entry written for a fixture cannot be repointed at a different value.
+
+    Three properties are the point, and each has a test in gate/tests/test_gate.py:
+
+      - HISTORY ONLY. A value still present in the HEAD tree is refused: the entry is reported and
+        the tree finding stays a BLOCK. Reviewing a fixture you can still fix invites leaving it
+        there; the tree is the copy that ships.
+      - NEVER A RULE. `read_secrets_reviewed` is consulted by `sweep_history` alone, for a
+        (fp12, path) pair. `sweep_tree` only uses it to detect the refusal above.
+      - NEVER SILENT. A matched entry still emits a WARN naming the file and line, so the report
+        shows what is being excused. An entry that matches nothing is a note telling you to delete
+        it, and a malformed line is a BLOCK, because cannot tell is never a pass.
+
+    This is deliberately NOT `.gitleaksignore`. That file silences SEC-1, the third-party scanner.
+    SEC-2 is the stdlib sweep precisely because the gate does not trust one scanner's judgement;
+    pointing both at one file would let the weaker check's remedy silence the stronger one. Two
+    files means a repo that wants both must make two separate, separately reasoned acts.
+    """
+    p = repo.root / REVIEWED_FILE
+    if not p.is_file():
+        return {}
+    out: dict[tuple[str, str], int] = {}
+    reason_ok = False
+    for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        s = line.strip()
+        if not s:
+            reason_ok = False
+            continue
+        if s.startswith("#"):
+            reason_ok = len(s.lstrip("#").strip()) >= 8
+            continue
+        parts = s.split()
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{12}", parts[0]):
+            r.add(BLOCK, f"SEC-2: {REVIEWED_FILE} line is not `<fp12> <path>`; a fingerprint is the 12 "
+                  "lowercase hex characters this gate prints as 'fp12', and a path has no spaces",
+                  REVIEWED_FILE, n, key=f"reviewed-badline|{n}")
+            continue
+        if "\\" in parts[1]:
+            r.add(BLOCK, f"SEC-2: {REVIEWED_FILE} entry names a path with a backslash; use the "
+                  "forward-slash path git reports, or the entry will never match anything",
+                  REVIEWED_FILE, n, key=f"reviewed-backslash|{n}")
+            continue
+        if not reason_ok:
+            r.add(BLOCK, "SEC-2: .secrets-reviewed entry with no reason; put a '# why this is not a "
+                  "secret' comment line above it", REVIEWED_FILE, n, key=f"reviewed-noreason|{s}")
+        out[(parts[0], parts[1])] = n
+    return out
 
 
 def run_gitleaks(repo: Repo, r: Result, staged: bool = False) -> None:
@@ -221,7 +277,10 @@ def _k8s(text: str):
                    f"{' (base64-decoded)' if block == 'data' else ''}; use an external secret store or sealed secret")
 
 
-def sweep_tree(repo: Repo, r: Result, files: list[str] | None = None) -> None:
+def sweep_tree(repo: Repo, r: Result, files: list[str] | None = None,
+               reviewed: dict[tuple[str, str], int] | None = None,
+               used: set[tuple[str, str]] | None = None) -> None:
+    reviewed = reviewed or {}
     for rel in files if files is not None else repo.all_tracked():
         text = repo.text(rel)
         if text is None:
@@ -230,11 +289,19 @@ def sweep_tree(repo: Repo, r: Result, files: list[str] | None = None) -> None:
                       key=f"tree|SEC-3|{rel}")
             continue
         for rule, ln, f, msg in judge_text(rel, text, "tree"):
+            if (f, rel) in reviewed:
+                if used is not None:
+                    used.add((f, rel))
+                msg += (f" [{REVIEWED_FILE} has an entry for this value at this path, but a reviewed entry "
+                        "excuses HISTORY only; the value is in the tree now, so fix it here and let the "
+                        "history entry stand on its own]")
             r.add(BLOCK, f"{msg} [fp12 {f}]", rel, ln, key=f"tree|{rule}|{rel}|{f}")
 
 
-def sweep_history(repo: Repo, r: Result) -> None:
+def sweep_history(repo: Repo, r: Result, reviewed: dict[tuple[str, str], int] | None = None,
+                  used: set[tuple[str, str]] | None = None) -> None:
     """Every blob reachable from any ref, once. HEAD-tree hits are already reported by sweep_tree."""
+    reviewed = reviewed or {}
     try:
         listing = repo.git("rev-list", "--objects", "--all")
     except RuntimeError as e:
@@ -262,6 +329,7 @@ def sweep_history(repo: Repo, r: Result) -> None:
                             stdout=subprocess.PIPE)
     assert proc.stdin and proc.stdout
     n_scanned = 0
+    warned: set[tuple[str, str, str]] = set()
     for sha, path in wanted.items():
         proc.stdin.write((sha + "\n").encode())
         proc.stdin.flush()
@@ -276,8 +344,22 @@ def sweep_history(repo: Repo, r: Result) -> None:
         n_scanned += 1
         text = data.decode("utf-8", "replace")
         for rule, ln, f, msg in judge_text(path, text, "history"):
+            k = (f, path)
+            if k in reviewed:
+                # Already excused. Still reported, so the suppression is visible in the run rather
+                # than inferred from a finding's absence; one WARN per value and path, not per blob.
+                if used is not None:
+                    used.add(k)
+                if (rule, path, f) not in warned:
+                    warned.add((rule, path, f))
+                    r.add(WARN, f"{msg} [in history only, blob {sha[:10]}; fp12 {f}]. Reviewed as a fixture "
+                          f"at {REVIEWED_FILE}:{reviewed[k]}; not blocking", path, ln,
+                          key=f"reviewed-hist|{rule}|{path}|{f}")
+                continue
             r.add(BLOCK, f"{msg} [in history only, blob {sha[:10]}; fp12 {f}]. A secret in history is an incident: "
-                  "rotate first, then decide on a history rewrite", path, ln, key=f"hist|{rule}|{path}|{f}")
+                  f"rotate first, then decide on a history rewrite. If it is a reviewed fixture, put "
+                  f"'{f} {path}' in {REVIEWED_FILE} under a comment saying why",
+                  path, ln, key=f"hist|{rule}|{path}|{f}")
     proc.stdin.close()
     proc.wait()
     r.notes.append(f"history sweep: {n_scanned} blob(s) outside HEAD scanned")
@@ -286,13 +368,20 @@ def sweep_history(repo: Repo, r: Result) -> None:
 def run(repo: Repo, opts) -> Result:
     r = Result("secrets", "Secrets: gitleaks (estate rules) + k8s/DSN/env/secrets-file sweep, tree and history")
     ignore_file_problems(repo, r)
+    reviewed = read_secrets_reviewed(repo, r)
+    used: set[tuple[str, str]] = set()
     if getattr(opts, "files", None):
-        sweep_tree(repo, r, opts.files)
+        sweep_tree(repo, r, opts.files, reviewed, used)
         if getattr(opts, "staged", False):
             run_gitleaks(repo, r, staged=True)
         return r
-    sweep_tree(repo, r)
+    sweep_tree(repo, r, reviewed=reviewed, used=used)
     if not getattr(opts, "no_history", False):
-        sweep_history(repo, r)
+        sweep_history(repo, r, reviewed, used)
+        # An entry that matched nothing is not a finding (the value may simply have been fixed and
+        # the entry forgotten), but leaving it means the file no longer describes the repo.
+        for f, path in sorted(set(reviewed) - used):
+            r.notes.append(f"{REVIEWED_FILE}: '{f} {path}' (line {reviewed[(f, path)]}) matches nothing now; "
+                           "delete the entry")
     run_gitleaks(repo, r)
     return r

@@ -14,6 +14,7 @@ GATE_GITLEAKS pointing at it. Without it they FAIL (cannot tell is never a pass)
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets as _rnd
@@ -214,6 +215,87 @@ class Secrets(Base):
             with self.subTest(path=path):
                 self.assertFails(dict(CLEAN_PY, **{path: f"TOKEN = '{canary}'\n"}), "secrets",
                                  "estate-gate-canary", env=self.env)
+
+    # ---- .secrets-reviewed: the SEC-2 history fixture path -------------------------------
+    # The k8s Secret shape is used throughout because gitleaks CANNOT see it (its
+    # kubernetes-secret-yaml rule is disabled in gate/gitleaks.toml, since it flags base64
+    # placeholders as loudly as real values), so these fixtures isolate SEC-2 from SEC-1.
+
+    @staticmethod
+    def _k8s(value: str) -> str:
+        # The key is deliberately not password-shaped: gitleaks' generic-api-key rule keys off the
+        # name, so `DB_PASSWORD: <base64>` is an SEC-1 finding and would drown the SEC-2 arm these
+        # fixtures are about. The gate's k8s judge decodes whatever the key is called.
+        b64 = base64.b64encode(value.encode()).decode()
+        return f"apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ndata:\n  P: {b64}\n"
+
+    @staticmethod
+    def _fp(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:12]
+
+    def test_reviewed_fixture_in_history_passes(self):
+        # The whole point of .secrets-reviewed: a value that IS a fixture, present only in an
+        # older blob, is excused by one reviewed line, and the excuse still shows in the report.
+        val = "pw-" + rnd(20)
+        reviewed = ("# Reviewed test fixture, not a credential: it is a synthetic value a test injects\n"
+                    "# to prove the k8s Secret judge decodes data: and reports it. See tests/test_db.py.\n"
+                    f"{self._fp(val)} k8s/secrets.yaml\n")
+        files = dict(CLEAN_PY, **{"k8s/secrets.yaml": self._k8s(val)})
+        data = self.assertPasses(files, "secrets",
+                                 extra=[{"k8s/secrets.yaml": self._k8s("CHANGEME"),
+                                         ".secrets-reviewed": reviewed}], env=self.env)
+        blocks = open_blocks(data, "secrets")
+        self.assertEqual(blocks, [], f"a reviewed history fixture must not block:\n{blocks}")
+        text = json.dumps(data)
+        self.assertIn("Reviewed as a fixture", text, "the excuse must be visible, not silent")
+
+    def test_unreviewed_fixture_in_history_still_fails(self):
+        # Negative control for the test above: the same shape and the same commits, with no
+        # .secrets-reviewed entry, must BLOCK. Without this, a passing review test proves nothing.
+        val = "pw-" + rnd(20)
+        files = dict(CLEAN_PY, **{"k8s/secrets.yaml": self._k8s(val)})
+        self.assertFails(files, "secrets", "in history only",
+                         extra=[{"k8s/secrets.yaml": self._k8s("CHANGEME")}], env=self.env)
+
+    def test_reviewed_entry_for_a_value_still_in_the_tree_is_refused(self):
+        # A reviewed entry excuses history only. Reviewing a value you can still delete invites
+        # leaving it in the tree, which is the copy that ships, so the entry is refused loudly and
+        # the tree finding stands.
+        val = "pw-" + rnd(20)
+        reviewed = ("# Reviewed test fixture, not a credential: this is synthetic test data.\n"
+                    f"{self._fp(val)} k8s/secrets.yaml\n")
+        self.assertFails(dict(CLEAN_PY, **{"k8s/secrets.yaml": self._k8s(val),
+                                           ".secrets-reviewed": reviewed}), "secrets",
+                         "excuses HISTORY only", env=self.env)
+
+    def test_reviewed_entry_without_a_reason_fails(self):
+        self.assertFails(dict(CLEAN_PY, **{".secrets-reviewed": f"{'0' * 12} src/x.py\n"}), "secrets",
+                         ".secrets-reviewed entry with no reason", env=self.env)
+
+    def test_reviewed_entry_that_is_not_a_fingerprint_fails(self):
+        for bad in ("some-rule src/x.py", f"{'A' * 12} src/x.py", "0" * 12):
+            with self.subTest(bad=bad):
+                self.assertFails(dict(CLEAN_PY, **{".secrets-reviewed": "# reviewed synthetic test data\n"
+                                                                       f"{bad}\n"}), "secrets",
+                                 "is not `<fp12> <path>`", env=self.env)
+
+    def test_reviewed_entry_that_matches_nothing_is_noted(self):
+        # Harmless but rotten: the file stops describing the repo. A note, not a block, because the
+        # value may simply have been fixed and the entry forgotten.
+        text = ("# Reviewed test fixture, not a credential: synthetic value a test injects.\n"
+                f"{'0' * 12} src/gone.py\n")
+        data = self.assertPasses(dict(CLEAN_PY, **{".secrets-reviewed": text}), "secrets", env=self.env)
+        self.assertIn("matches nothing now", json.dumps(data), "a stale entry must be reported, not silently ignored")
+
+    def test_a_secret_parked_in_the_review_file_still_fails(self):
+        # The remedy file must not become a hiding place. gitleaks cannot see a k8s Secret value,
+        # but SEC-2's own judge reads every tracked file by content, so a real-looking DSN in a
+        # comment here is still a finding.
+        dsn = "postgres" + "ql://svc:" + rnd(16) + "@db.internal:5432/app"
+        text = ("# Reviewed test fixture, not a credential: see the note in the runbook.\n"
+                f"# {dsn}\n" + f"{'0' * 12} src/gone.py\n")
+        self.assertFails(dict(CLEAN_PY, **{".secrets-reviewed": text}), "secrets",
+                         "URL carries a password", env=self.env)
 
     def test_missing_gitleaks_is_cannot_tell(self):
         home = tempfile.mkdtemp(prefix="repogate-home-")

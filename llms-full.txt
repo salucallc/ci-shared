@@ -1,8 +1,8 @@
 # salucallc/ci-shared
 
-> Reusable GitHub Actions workflows (workflow_call) for salucallc and saluca-labs repos: Python and Node stack CI, Docker lint/build/scan, SAST, secret scanning, release on tag, and a README/llms.txt docs check. MIT licence.
+> Reusable GitHub Actions workflows (workflow_call) for salucallc and saluca-labs repos: Python and Node stack CI, Docker lint/build/scan, SAST, secret scanning, release on tag, a README/llms.txt docs check, and the estate merge gate (merge-gate.yml plus the gate/ checks it runs). MIT licence.
 
-This repo holds workflows and two small stdlib Python helpers; it is not a library or an action. Consumers call a workflow by full commit SHA, never by tag or branch. Every third-party action inside is pinned to a commit SHA.
+This repo holds workflows, small stdlib Python helpers, and the merge gate (gate/, stdlib only, runnable before a push with `python tools/gate.py run --repo <dir>`); it is not a library or an action. Consumers call a workflow by full commit SHA, never by tag or branch. Every third-party action inside is pinned to a commit SHA.
 
 If a workflow, input or tool is not listed here or in the README's Reusable workflows table, it does not exist. The complete callable surface is the eleven workflows below plus the two scripts in tools/.
 
@@ -225,6 +225,43 @@ What each job checks (the requirement ids are the standard's):
 
 The gate fails closed. A tool it cannot run, a registry it cannot reach, or a file it cannot read
 is cannot-tell (exit 2), which fails the gate, never a pass.
+
+##### Reviewed fixtures: two files, two checks
+
+A test that injects a credential-shaped value on purpose is not an incident, but the two secret
+checks need telling separately. They are two files on purpose: SEC-1 is a third-party scanner, and
+SEC-2 is the stdlib sweep that exists because the gate does not trust one scanner's judgement.
+One file would let the weaker check's remedy silence the stronger one.
+
+`.gitleaksignore` excuses a SEC-1 finding, one fingerprint per line, each under a comment saying
+why. `.secrets-reviewed` excuses a SEC-2 **history** finding, one entry per line, in the form
+`<fp12> <path>`, each under a comment saying why. `fp12` is the 12 characters the gate prints in
+the finding, `<path>` is the repo-relative path it names.
+
+```console
+$ cat .secrets-reviewed
+# Synthetic fixture, not a credential: tests/test_redactor.py injects this DSN to prove the
+# redactor masks it. Nothing here is live.
+0f1e2d3c4b5a tests/test_redactor.py
+```
+
+What an entry cannot do, by construction:
+
+- **It cannot reach the tree.** A value still present in the HEAD tree is refused, and the tree
+  finding stands. Reviewing a fixture you can still delete invites leaving it in the copy that
+  ships; the entry only ever excuses a blob you cannot edit without rewriting history.
+- **It cannot name a rule, directory, glob or pattern.** The key is `(fp12, path)`, and `fp12` is a
+  hash of the value, so an entry written for one value cannot be repointed at another.
+- **It cannot be silent.** A matched entry still prints a warn naming the file and line, so the
+  excuse is visible in the run. An entry that matches nothing prints a note telling you to delete
+  it, and a malformed line is a block.
+- **It cannot be reached from `.gate.toml`.** `secrets` is in both `NO_WAIVE` and `NO_BASELINE`, and
+  neither file is read by `gate/cli.py`.
+
+Never quote a secret value, or a shape a scanner matches, in either file's reason comment. Describe
+what the value is and point at the test that uses it. `.gitleaksignore` is excluded from the
+gitleaks scan because explaining a false positive means quoting what was dismissed; `.secrets-reviewed`
+is not excluded, so a real-looking value written there is still a finding.
 
 Run it before a push (Python 3.11+, standard library only):
 
