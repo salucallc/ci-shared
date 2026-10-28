@@ -982,5 +982,56 @@ class GateConfig(Base):
         self.assertIn("the baseline grew", out)
 
 
+def run_detect(files):
+    """Run `gate detect` against a throwaway repo and return (code, output, GITHUB_OUTPUT text)."""
+    repo = GateRepo(files)
+    try:
+        gh_out = repo.path.parent / f"{repo.path.name}-github-output.txt"
+        e = dict(os.environ, PYTHONIOENCODING="utf-8", GITHUB_OUTPUT=str(gh_out))
+        res = subprocess.run([sys.executable, "-m", "gate", "detect", "--repo", str(repo.path)],
+                             cwd=ROOT, capture_output=True, text=True, encoding="utf-8", env=e)
+        return res.returncode, res.stdout + res.stderr, (gh_out.read_text(encoding="utf-8") if gh_out.exists() else "")
+    finally:
+        repo.close()
+
+
+class Detect(unittest.TestCase):
+    """`gate detect` decides whether the reusable workflow runs python-tests. It may only ever
+    say false for a repo it cannot test, and it must say WHY rather than skip in silence."""
+
+    def test_root_marker_runs_python_tests(self):
+        code, out, gh = run_detect(dict(CLEAN_PY, **{"requirements.txt": "pytest\n"}))
+        self.assertEqual(code, 0, out)
+        self.assertIn("python=true", gh)
+        self.assertIn("python_marker=\n", gh + "\n")
+        self.assertNotIn("::notice::", out)
+
+    def test_nested_marker_does_not_flip_python(self):
+        # reusable-python-ci.yml installs only from a ROOT manifest; flagging a nested one would
+        # run `pytest` at the root with nothing installed. So python stays false, and the notice
+        # names the marker so the skip is legible instead of looking like missing coverage.
+        files = {k: v for k, v in CLEAN_PY.items() if not k.startswith("requirements")}
+        files["tools/requirements.txt"] = "pytest\n"
+        code, out, gh = run_detect(files)
+        self.assertEqual(code, 0, out)
+        self.assertIn("python=false", gh)
+        self.assertIn("python_marker=tools/requirements.txt", gh)
+        self.assertIn("::notice::", out)
+        self.assertIn("tools/requirements.txt", out)
+
+    def test_no_marker_is_quiet(self):
+        files = {k: v for k, v in CLEAN_PY.items() if not k.startswith("requirements")}
+        code, out, gh = run_detect(files)
+        self.assertEqual(code, 0, out)
+        self.assertIn("python=false", gh)
+        self.assertIn("python_marker=\n", gh + "\n")
+        self.assertNotIn("::notice::", out)
+
+    def test_node_still_detected_from_root(self):
+        code, out, gh = run_detect(dict(CLEAN_PY, **{"package.json": '{"name": "x"}\n'}))
+        self.assertEqual(code, 0, out)
+        self.assertIn("node=true", gh)
+
+
 if __name__ == "__main__":
     unittest.main()

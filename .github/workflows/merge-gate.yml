@@ -68,6 +68,9 @@ jobs:
     outputs:
       python: ${{ steps.detect.outputs.python }}
       node: ${{ steps.detect.outputs.node }}
+      # The first Python marker found below the repo root, when python is false. It changes
+      # nothing about what runs; it only lets gate-all say why python-tests was skipped.
+      python_marker: ${{ steps.detect.outputs.python_marker }}
     steps:
       - name: Refuse a missing or malformed gate-ref
         env:
@@ -205,6 +208,8 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           PY: ${{ needs.detect.outputs.python == 'true' && inputs.python-ci != 'skip' }}
+          PY_MARKER: ${{ needs.detect.outputs.python_marker }}
+          PY_CI: ${{ inputs.python-ci }}
           NODE: ${{ needs.detect.outputs.node == 'true' && inputs.node-ci != 'skip' }}
           PY_SAST: ${{ needs.detect.outputs.python == 'true' && inputs.sast }}
           SAST: ${{ inputs.sast }}
@@ -217,6 +222,14 @@ jobs:
                       "python-tests": os.environ["PY"] == "true", "node-tests": os.environ["NODE"] == "true",
                       "sast-python": os.environ["PY_SAST"] == "true", "semgrep": os.environ["SAST"] == "true"}
           bad = []
+          marker = os.environ.get("PY_MARKER", "")
+          why = ""
+          if marker:
+              why = (f" (no Python marker at the repo root; found {marker}. The gate installs only from a "
+                     "root-level manifest, so it will not run this repo's tests for it: the repo's own "
+                     "workflow must)")
+          elif os.environ.get("PY_CI") == "skip":
+              why = " (python-ci: skip)"
           for job, should_run in expected.items():
               res = needs.get(job, {}).get("result", "missing")
               if res in ("failure", "cancelled", "missing"):
@@ -224,7 +237,7 @@ jobs:
               elif res == "skipped" and should_run:
                   bad.append(f"{job}: skipped but should have run")
               elif res == "success" or res == "skipped":
-                  print(f"{job}: {res}")
+                  print(f"{job}: {res}" + (why if job == "python-tests" and res == "skipped" else ""))
           for b in bad:
               print(f"::error::merge gate: {b}")
           sys.exit(1 if bad else 0)
