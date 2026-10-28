@@ -43,6 +43,29 @@ def extra_patterns() -> list[re.Pattern]:
     return out
 
 
+# The characters a lone backslash may introduce inside a JSON string.
+JSON_ESCAPES = set('"\\/bfnrtu')
+
+
+def is_json_escape(rel: str, line: str, m: re.Match) -> bool:
+    """True when a DRIVE match is a JSON escape sequence rather than a drive.
+
+    A JSON string holds a newline as two characters, backslash and `n`, so a value such as
+    `"A:\\n    ..."` reads line by line as drive `A:`, a backslash separator and a next
+    character. That is how 33 blocking findings appeared on saluca-corp's generated run
+    records on 2026-10-27, every one of them an escape sequence and none of them a path.
+
+    A real Windows path inside a JSON string has to be written with a doubled backslash
+    (`"C:\\\\Users\\\\x"`), which matches the separator as two characters and is unaffected.
+    So in a .json file a LONE backslash followed by one of JSON's escape characters is an
+    escape, never a path separator. Nothing is skipped in any other file type: in Python a
+    `"C:\\temp"` is a TAB and is exactly the bug this check exists to catch.
+    """
+    if not rel.lower().endswith(".json") or m.group(2) != "\\":
+        return False
+    return line[m.end():m.end() + 1] in JSON_ESCAPES
+
+
 def prose_lines_in_python(text: str) -> set[int]:
     """Line numbers that hold a docstring or a comment."""
     lines: set[int] = set()
@@ -92,6 +115,8 @@ def scan_text(rel: str, text: str, extra: list[re.Pattern] | None = None):
             continue
         for m in DRIVE.finditer(line):
             if "://" in line[m.start():m.start() + 4]:
+                continue
+            if is_json_escape(rel, line, m):
                 continue
             tok = line[m.start():m.start() + 24]
             if OS_PATH.match(line[m.start():]):

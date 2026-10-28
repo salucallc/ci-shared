@@ -369,6 +369,17 @@ class Paths(Base):
         self.assertPasses(dict(CLEAN_PY, **{"src/io.py": 'from pathlib import Path\nDATA = Path(__file__).parent / "data"\n'
                                                          'URL = "https://example.com/a:b"\n'}), "paths", allow=("pass",))
 
+    def test_json_escape_sequence_is_not_a_drive(self):
+        # saluca-corp 2026-10-27: 33 blocking findings on generated run records, every one of
+        # them a \n or \t escape sequence read as drive `A:` / `f:` / `n:`. None was a path.
+        run = json.dumps({"response": "A:\n    ```json\n    {\n", "note": "f:\n- base case"}) + "\n"
+        self.assertPasses(dict(CLEAN_PY, **{"rd/results/runs/0008.json": run}), "paths", allow=("pass",))
+
+    def test_real_path_inside_json_still_blocks(self):
+        # The escape fix must not blind the check: a doubled backslash is a real path in JSON.
+        cfg = json.dumps({"env": "C:\\saluca-deploy\\.env"}) + "\n"
+        self.assertFails(dict(CLEAN_PY, **{"rd/config.json": cfg}), "paths", "hardcoded Windows path")
+
 
 class ControlChars(Base):
     def test_mangled_tab_escape_fails(self):
