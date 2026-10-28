@@ -313,11 +313,31 @@ def main(argv: list[str] | None = None) -> int:
         py = any(f in files for f in ("pyproject.toml", "setup.py", "setup.cfg")) or any(
             re.match(r"requirements[\w.-]*\.txt$", f) for f in files)
         node = "package.json" in files
-        lines = [f"python={'true' if py else 'false'}", f"node={'true' if node else 'false'}"]
+        # A repo whose Python lives in a subdirectory is NOT a Python project to this gate:
+        # reusable-python-ci.yml installs only from root-level manifests and then runs `pytest` at
+        # the repo root, so flagging it would run the suite with no dependencies installed and turn
+        # the job red for no reason. The flag stays false. What changed here is that the skip is
+        # now EXPLAINED: the first time this bit (saluca-campus-game keeps its requirements at
+        # tools/requirements.txt), a reader saw "python-tests: skipped" and could not tell whether
+        # the tests had run at all. They had, in the repo's own ci.yml. Saying so costs nothing.
+        nested = [] if py else sorted(
+            f for f in files
+            if "/" in f and (
+                f.rsplit("/", 1)[1] in ("pyproject.toml", "setup.py", "setup.cfg")
+                or re.match(r"requirements[\w.-]*\.txt$", f.rsplit("/", 1)[1])))
+        lines = [f"python={'true' if py else 'false'}", f"node={'true' if node else 'false'}",
+                 f"python_marker={nested[0] if nested else ''}"]
         if os.environ.get("GITHUB_OUTPUT"):
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("\n".join(lines) + "\n")
         print("\n".join(lines))
+        if nested:
+            shown = ", ".join(nested[:3]) + (f" and {len(nested) - 3} more" if len(nested) > 3 else "")
+            print(f"::notice::python=false: no Python marker at the repo root, but this tree has {shown}. "
+                  "The gate will not run python-tests, because it installs only from a root-level "
+                  "pyproject.toml, setup.py, setup.cfg or requirements*.txt and would then run pytest "
+                  "at the root with no dependencies. If these tests matter, this repo's own workflow "
+                  "must run them.")
         return 0
     if not repo.is_git():
         print(f"gate: {repo.root} is not a git work tree; cannot tell", file=sys.stderr)

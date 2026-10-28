@@ -127,6 +127,14 @@ The two stack workflows take `auto`, `skip` or a shell command for each step. `a
 the repo; `skip` logs that the step did not run. A step that found nothing to run says so with a
 notice rather than passing silently. `self-test.yml` runs both against `fixtures/` on every PR.
 
+**A Python project means a marker at the repo root** (`pyproject.toml`, `setup.py`, `setup.cfg` or
+`requirements*.txt`), because `reusable-python-ci.yml` installs from a root manifest and then runs
+`pytest` at the root. A repo whose requirements live in a subdirectory therefore does not get
+`python-tests`, and the gate now names that subdirectory in a notice instead of skipping in
+silence, so nobody has to guess whether the tests ran somewhere else. They have to run in the
+repo's own workflow. `gate detect` writes the path to the `python_marker` output for the same
+reason.
+
 ##### Adopting the stack CI (the estate's default)
 
 ```yaml
