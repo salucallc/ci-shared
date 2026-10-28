@@ -208,6 +208,7 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           PY: ${{ needs.detect.outputs.python == 'true' && inputs.python-ci != 'skip' }}
+          PY_DETECTED: ${{ needs.detect.outputs.python }}
           PY_MARKER: ${{ needs.detect.outputs.python_marker }}
           PY_CI: ${{ inputs.python-ci }}
           NODE: ${{ needs.detect.outputs.node == 'true' && inputs.node-ci != 'skip' }}
@@ -224,10 +225,10 @@ jobs:
           bad = []
           marker = os.environ.get("PY_MARKER", "")
           why = ""
-          if marker:
-              why = (f" (no Python marker at the repo root; found {marker}. The gate installs only from a "
-                     "root-level manifest, so it will not run this repo's tests for it: the repo's own "
-                     "workflow must)")
+          if os.environ.get("PY_DETECTED") != "true":
+              where = f", found {marker}" if marker else ""
+              why = (f" (no Python marker at the repo root{where}: the gate runs only root-level "
+                     "Python projects, so it does not run these tests)")
           elif os.environ.get("PY_CI") == "skip":
               why = " (python-ci: skip)"
           for job, should_run in expected.items():
