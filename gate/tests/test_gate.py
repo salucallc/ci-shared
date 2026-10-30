@@ -385,6 +385,48 @@ class SecretsScope(Base):
         self.assertIn("pre-existing secrets", out)
         self.assertNoValue(out, old, new)
 
+    @staticmethod
+    def _k8s_p(value: str) -> str:
+        # Same shape as Secrets._k8s: a key gitleaks cannot see, so these isolate SEC-2.
+        b64 = base64.b64encode(value.encode()).decode()
+        return f"apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ndata:\n  P: {b64}\n"
+
+    def test_reviewed_entry_marks_a_pre_existing_value_and_is_used(self):
+        # Scoped mode: a reviewed history fixture that was already there is reported as reviewed
+        # (visible, not silent) and does not block, and the entry counts as matched.
+        val = "pw-" + rnd(20)
+        fp = hashlib.sha256(val.encode()).hexdigest()[:12]
+        reviewed = ("# Reviewed test fixture, not a credential: a synthetic value a test injects.\n"
+                    f"{fp} k8s/secrets.yaml\n")
+        r = self.repo(dict(CLEAN_PY, **{"k8s/secrets.yaml": self._k8s_p(val)}))
+        self.step(r, {"k8s/secrets.yaml": self._k8s_p("CHANGEME"), ".secrets-reviewed": reviewed}, "fixture out")
+        r._git("branch", "base")
+        self.step(r, {"src/calc.py": "def add(a, b):\n    return b + a\n"}, "unrelated change")
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 0, out)
+        pre = findings(data, "secrets", "pre-existing")
+        self.assertTrue(any(f["path"] == "k8s/secrets.yaml" and "Reviewed as a fixture" in f["message"]
+                            for f in pre), out)
+        self.assertNotIn("matches nothing now", json.dumps(data), out)
+        self.assertNoValue(out, val)
+
+    def test_reviewed_entry_never_unblocks_a_value_the_change_adds(self):
+        # The file can only mark what was already there. A value this change adds blocks even when
+        # the same change writes a reviewed entry for it, or the remedy file would be a bypass.
+        val = "pw-" + rnd(20)
+        fp = hashlib.sha256(val.encode()).hexdigest()[:12]
+        reviewed = ("# Reviewed test fixture, not a credential: a synthetic value a test injects.\n"
+                    f"{fp} k8s/secrets.yaml\n")
+        r = self.repo(CLEAN_PY)
+        r._git("branch", "base")
+        self.step(r, {"k8s/secrets.yaml": self._k8s_p(val)}, "add it")
+        self.step(r, {"k8s/secrets.yaml": self._k8s_p("CHANGEME"), ".secrets-reviewed": reviewed}, "review it")
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        blocking = findings(data, "secrets", "open")
+        self.assertTrue(any(f["path"] == "k8s/secrets.yaml" and "this change" in f["message"] for f in blocking), out)
+        self.assertNoValue(out, val)
+
     def test_secret_only_in_an_old_commit_does_not_block(self):
         old = canary()
         r = self.repo(dict(CLEAN_PY, **{"src/conf.py": f'TOKEN = "{old}"\n'}))
