@@ -205,7 +205,7 @@ What each job checks (the requirement ids are the standard's):
 
 | Job | Ids | Fails when |
 |---|---|---|
-| `secrets` | SEC-1..4 | gitleaks 8.30.1 (checksum-verified, estate rules in `gate/gitleaks.toml`) finds a secret in any commit of any ref; or the stdlib sweep finds a k8s Secret `data:` value that decodes to a real value, a database URL with a real password, a secret-shaped value in an env template, or a committed `.env`, key or service-account file, in the tree or in any history blob |
+| `secrets` | SEC-1..4 | gitleaks 8.30.1 (checksum-verified, estate rules in `gate/gitleaks.toml`) finds a secret in any commit of any ref; or the stdlib sweep finds a k8s Secret `data:` value that decodes to a real value, a database URL with a real password, a secret-shaped value in an env template, or a committed `.env`, key or service-account file, in the tree or in any history blob. Only a secret the change adds or touches blocks: the change is every commit from the merge-base with `--base-ref` (the PR base in CI, else the remote default branch) to HEAD, history-only commits included, plus the working tree. A secret already in history does not block an unrelated push; it is listed as pre-existing, by fingerprint, never by value. No base that resolves is cannot tell; `--whole-repo` makes every commit of every ref the change |
 | `paths` | TST-3, EXP-1 | an estate path or tailnet host anywhere; an absolute drive or home path in code or config |
 | `control-chars` | TST-4 | a control character that a mangled backslash escape leaves (TAB after text in Python or JS, 0x07, 0x08, 0x0B, 0x0C), a bare CR, or an invisible or bidi character |
 | `style` | STY-1, STY-3 | an em-dash in any prose file (the one exception is the "Saluca Labs" sign-off, alone or as an HTML element whose whole text it is); a shell, Dockerfile or cron file stored with CRLF or not LF-pinned in `.gitattributes` |
@@ -278,6 +278,11 @@ finding, with a reason, a GitHub issue link and an expiry date of at most a year
 is printed on every run. Secrets cannot be waived. Pre-existing findings can be recorded once in
 `.gate-baseline.json` (`python tools/gate.py baseline`) so that adopting the gate does not freeze a
 repo; on a pull request the baseline may only shrink.
+
+Secrets are never baselined either. Touching the line of an old secret blocks, and so does a secret
+added and removed inside the branch; an old secret the change leaves alone is printed under
+"pre-existing secrets" with its gitleaks fingerprint or `fp12`, for the PR body. It is an
+incident to triage, not debt to record.
 
 `gate/tests/test_gate.py` holds a fixture that must fail and one that must pass for every check.
 The fixtures plant a fake secret with a fake prefix, a hardcoded path, an xfail with no reason, an

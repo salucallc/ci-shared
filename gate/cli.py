@@ -230,7 +230,8 @@ def render(repo: Repo, results: list[Result], out=None, max_items: int = 40) -> 
     for r in results:
         shown = [f for f in r.findings if f.state == "open" and f.severity == BLOCK] + \
             [f for f in r.findings if f.severity == WARN] + [f for f in r.findings if f.state == "waived"]
-        if not shown and not (r.notes and r.status in (CANNOT, NA, CI_ONLY)):
+        pre = [f for f in r.findings if f.state == "pre-existing"]
+        if not shown and not pre and not (r.notes and r.status in (CANNOT, NA, CI_ONLY)):
             continue
         print(f"\n[{r.check}] {r.title}: {r.status}", file=out)
         for n in r.notes:
@@ -240,6 +241,13 @@ def render(repo: Repo, results: list[Result], out=None, max_items: int = 40) -> 
             print(f"  {tag:<6} {f.where()}  {f.message}" + (f"  [{f.note}]" if f.note else ""), file=out)
         if len(shown) > max_items:
             print(f"  ... {len(shown) - max_items} more (use --json for all)", file=out)
+        if pre:
+            print(f"  pre-existing secrets ({len(pre)}, outside this change, not blocking; list them in the PR body "
+                  "by fingerprint, never by value):", file=out)
+            for f in pre[:max_items]:
+                print(f"  pre    {f.where()}  {f.message}", file=out)
+            if len(pre) > max_items:
+                print(f"  ... {len(pre) - max_items} more (use --json for all)", file=out)
 
 
 def verdict(results: list[Result]) -> int:
@@ -293,7 +301,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-audit", dest="audit", action="store_false")
     ap.add_argument("--no-history", action="store_true", help="secrets: tree only (pre-commit speed; never a push verdict)")
     ap.add_argument("--staged", action="store_true")
-    ap.add_argument("--base-ref", help="the PR's base, for the baseline-may-only-shrink rule")
+    ap.add_argument("--base-ref", help="the PR's base. Secrets: the change is merge-base(BASE, HEAD)..HEAD plus the working "
+                    "tree, and only a secret it adds or touches blocks (default: the remote default branch, origin/HEAD, "
+                    "origin/main or origin/master; none resolvable is cannot tell). Also the baseline-may-only-shrink rule")
+    ap.add_argument("--whole-repo", action="store_true", help="secrets: no base; every commit of every ref is the change "
+                    "and every finding blocks (a repo's first push, or a full audit)")
     ap.add_argument("--repo-slug")
     ap.add_argument("--branch")
     ap.add_argument("--visibility", choices=["public", "private"])

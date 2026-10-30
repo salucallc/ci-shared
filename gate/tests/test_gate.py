@@ -51,6 +51,11 @@ class GateRepo:
     def _git(self, *args):
         subprocess.run(["git", *GIT_ID, "-C", str(self.path), *args], check=True, capture_output=True)
 
+    def _out(self, *args) -> str:
+        """stdout of a git command, for the tests that need a sha rather than a side effect."""
+        return subprocess.run(["git", *GIT_ID, "-C", str(self.path), *args], check=True,
+                              capture_output=True, text=True, encoding="utf-8").stdout.strip()
+
     def write(self, files):
         for rel, content in files.items():
             p = self.path / rel
@@ -125,14 +130,25 @@ class Base(unittest.TestCase):
         return data
 
 
+def gitleaks_env() -> dict:
+    env = {}
+    if not os.environ.get("GATE_GITLEAKS"):
+        exe = Path.home() / ".cache" / "saluca-gate" / "gitleaks-8.30.1" / ("gitleaks.exe" if os.name == "nt" else "gitleaks")
+        if exe.is_file():
+            env["GATE_GITLEAKS"] = str(exe)
+    return env
+
+
 class Secrets(Base):
+    """What the scan finds. These fixtures have no base, so they run with --whole-repo: every commit
+    of every ref is the change, and every finding blocks. SecretsScope covers base..HEAD."""
+
     @classmethod
     def setUpClass(cls):
-        cls.env = {}
-        if not os.environ.get("GATE_GITLEAKS"):
-            exe = Path.home() / ".cache" / "saluca-gate" / "gitleaks-8.30.1" / ("gitleaks.exe" if os.name == "nt" else "gitleaks")
-            if exe.is_file():
-                cls.env["GATE_GITLEAKS"] = str(exe)
+        cls.env = gitleaks_env()
+
+    def run_gate(self, files, *args, extra=None, env=None):
+        return super().run_gate(files, *args, "--whole-repo", extra=extra, env=env)
 
     def test_canary_with_fake_prefix_fails(self):
         canary = "SALUCA_GATE_" + "CANARY_" + rnd(28)
@@ -307,6 +323,338 @@ class Secrets(Base):
 
     def test_clean_repo_passes(self):
         self.assertPasses(CLEAN_PY, "secrets", env=self.env, allow=("pass",))
+
+
+def canary() -> str:
+    return "SALUCA_GATE_" + "CANARY_" + rnd(28)
+
+
+def k8s_secret(*pairs: tuple[str, str]) -> str:
+    lines = "".join(f"  {k}: {base64.b64encode(v.encode()).decode()}\n" for k, v in pairs)
+    return f"apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ndata:\n{lines}"
+
+
+def findings(data: dict, check: str, state: str) -> list[dict]:
+    for c in data.get("checks", []):
+        if c["check"] == check:
+            return [f for f in c["findings"] if f["severity"] == "block" and f["state"] == state]
+    return []
+
+
+class SecretsScope(Base):
+    """The amended rule (estate-rules#8, repo-merge-gate.md SEC-4): a secret blocks when the change
+    base..HEAD adds or touches it, in the tree or in any commit of the range; a secret that was
+    already there is reported, by fingerprint and never by value, and does not block. No base that
+    can be resolved is cannot tell."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = gitleaks_env()
+
+    def repo(self, files: dict) -> GateRepo:
+        r = GateRepo(files)
+        self.addCleanup(r.close)
+        return r
+
+    def step(self, r: GateRepo, files: dict, msg: str = "change") -> None:
+        r.write({k: v for k, v in files.items() if v is not None})
+        for k, v in files.items():
+            if v is None:
+                r._git("rm", "-q", k)
+        r.commit(msg)
+
+    def scoped(self, r: GateRepo, *args):
+        return r.gate("--only", "secrets", "--offline", "--no-audit", *args, env=self.env)
+
+    def assertNoValue(self, out: str, *values: str):
+        for v in values:
+            self.assertNotIn(v, out, "a secret value reached the output")
+
+    def test_new_secret_in_changed_file_blocks_and_old_one_is_reported(self):
+        old, new = canary(), canary()
+        r = self.repo(dict(CLEAN_PY, **{"src/old.py": f'TOKEN = "{old}"\n'}))
+        r._git("branch", "base")
+        self.step(r, {"src/new.py": f'KEY = "{new}"\n'})
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        blocking = findings(data, "secrets", "open")
+        self.assertTrue(blocking and all(f["path"] == "src/new.py" for f in blocking), out)
+        self.assertTrue(all("this change" in f["message"] for f in blocking), out)
+        pre = findings(data, "secrets", "pre-existing")
+        self.assertTrue(any(f["path"] == "src/old.py" for f in pre), out)
+        self.assertIn("pre-existing secrets", out)
+        self.assertNoValue(out, old, new)
+
+    @staticmethod
+    def _k8s_p(value: str) -> str:
+        # Same shape as Secrets._k8s: a key gitleaks cannot see, so these isolate SEC-2.
+        b64 = base64.b64encode(value.encode()).decode()
+        return f"apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ndata:\n  P: {b64}\n"
+
+    def test_reviewed_entry_marks_a_pre_existing_value_and_is_used(self):
+        # Scoped mode: a reviewed history fixture that was already there is reported as reviewed
+        # (visible, not silent) and does not block, and the entry counts as matched.
+        val = "pw-" + rnd(20)
+        fp = hashlib.sha256(val.encode()).hexdigest()[:12]
+        reviewed = ("# Reviewed test fixture, not a credential: a synthetic value a test injects.\n"
+                    f"{fp} k8s/secrets.yaml\n")
+        r = self.repo(dict(CLEAN_PY, **{"k8s/secrets.yaml": self._k8s_p(val)}))
+        self.step(r, {"k8s/secrets.yaml": self._k8s_p("CHANGEME"), ".secrets-reviewed": reviewed}, "fixture out")
+        r._git("branch", "base")
+        self.step(r, {"src/calc.py": "def add(a, b):\n    return b + a\n"}, "unrelated change")
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 0, out)
+        pre = findings(data, "secrets", "pre-existing")
+        self.assertTrue(any(f["path"] == "k8s/secrets.yaml" and "Reviewed as a fixture" in f["message"]
+                            for f in pre), out)
+        self.assertNotIn("matches nothing now", json.dumps(data), out)
+        self.assertNoValue(out, val)
+
+    def test_reviewed_entry_never_unblocks_a_value_the_change_adds(self):
+        # The file can only mark what was already there. A value this change adds blocks even when
+        # the same change writes a reviewed entry for it, or the remedy file would be a bypass.
+        val = "pw-" + rnd(20)
+        fp = hashlib.sha256(val.encode()).hexdigest()[:12]
+        reviewed = ("# Reviewed test fixture, not a credential: a synthetic value a test injects.\n"
+                    f"{fp} k8s/secrets.yaml\n")
+        r = self.repo(CLEAN_PY)
+        r._git("branch", "base")
+        self.step(r, {"k8s/secrets.yaml": self._k8s_p(val)}, "add it")
+        self.step(r, {"k8s/secrets.yaml": self._k8s_p("CHANGEME"), ".secrets-reviewed": reviewed}, "review it")
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        blocking = findings(data, "secrets", "open")
+        self.assertTrue(any(f["path"] == "k8s/secrets.yaml" and "this change" in f["message"] for f in blocking), out)
+        self.assertNoValue(out, val)
+
+    def test_secret_only_in_an_old_commit_does_not_block(self):
+        old = canary()
+        r = self.repo(dict(CLEAN_PY, **{"src/conf.py": f'TOKEN = "{old}"\n'}))
+        self.step(r, {"src/conf.py": "TOKEN = None\n"}, "remove the token")
+        r._git("branch", "base")
+        self.step(r, {"src/calc.py": "def add(a, b):\n    return b + a\n"}, "unrelated change")
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(status_of(data, "secrets"), "warn", out)
+        pre = findings(data, "secrets", "pre-existing")
+        self.assertTrue(any("estate-gate-canary" in f["message"] and "fingerprint" in f["message"] for f in pre), out)
+        self.assertNoValue(out, old)
+
+    def test_secret_added_and_removed_inside_the_range_blocks(self):
+        old, new = canary(), canary()
+        r = self.repo(dict(CLEAN_PY, **{"src/old.py": f'TOKEN = "{old}"\n'}))
+        self.step(r, {"src/old.py": "TOKEN = None\n"})
+        r._git("branch", "base")
+        self.step(r, {"src/x.py": f'KEY = "{new}"\n'}, "add a key")
+        self.step(r, {"src/x.py": "KEY = None\n"}, "take it out again")
+        val = "pw-" + rnd(20)
+        self.step(r, {"k8s/db.yaml": k8s_secret(("DB_PASSWORD", val))}, "a k8s secret")
+        self.step(r, {"k8s/db.yaml": None}, "and remove it")
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        blocking = findings(data, "secrets", "open")
+        self.assertTrue(any("estate-gate-canary" in f["message"] and f["path"] == "src/x.py" for f in blocking), out)
+        self.assertTrue(any("k8s Secret data.DB_PASSWORD" in f["message"] for f in blocking), out)
+        self.assertTrue(all("this change" in f["message"] for f in blocking), out)
+        self.assertFalse(any(f["path"] == "src/old.py" for f in blocking), out)
+        self.assertTrue(any(f["path"] == "src/old.py" for f in findings(data, "secrets", "pre-existing")), out)
+        self.assertNoValue(out, old, new, val)
+
+    def test_touching_the_line_of_an_old_secret_blocks(self):
+        old = canary()
+        r = self.repo(dict(CLEAN_PY, **{"src/conf.py": f'TOKEN = "{old}"\nOTHER = 1\n'}))
+        r._git("branch", "base")
+        self.step(r, {"src/conf.py": f'TOKEN = "{old}"  # still here\nOTHER = 1\n'})
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        blocking = findings(data, "secrets", "open")
+        self.assertTrue(any("estate-gate-canary" in f["message"] and "this change" in f["message"] for f in blocking), out)
+        self.assertNoValue(out, old)
+
+    def test_touching_the_line_of_an_old_k8s_secret_blocks(self):
+        val = "pw-" + rnd(20)
+        r = self.repo(dict(CLEAN_PY, **{"k8s/db.yaml": k8s_secret(("DB_PASSWORD", val))}))
+        r._git("branch", "base")
+        self.step(r, {"k8s/db.yaml": k8s_secret(("DB_PASSWORD", val)).rstrip("\n") + "  # touched\n"})
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        blocking = findings(data, "secrets", "open")
+        self.assertTrue(any("k8s Secret data.DB_PASSWORD" in f["message"] and "this change" in f["message"]
+                            for f in blocking), out)
+        self.assertNoValue(out, val)
+
+    def test_editing_another_line_of_a_file_with_an_old_secret_does_not_block(self):
+        old, val = canary(), "pw-" + rnd(20)
+        r = self.repo(dict(CLEAN_PY, **{"src/conf.py": f'TOKEN = "{old}"\nOTHER = 1\n',
+                                        "k8s/db.yaml": k8s_secret(("DB_PASSWORD", val))}))
+        r._git("branch", "base")
+        self.step(r, {"src/conf.py": f'TOKEN = "{old}"\nOTHER = 2\n',
+                      "k8s/db.yaml": k8s_secret(("DB_PASSWORD", val), ("DB_USER", "CHANGEME"))})
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 0, out)
+        pre = findings(data, "secrets", "pre-existing")
+        self.assertTrue(any(f["path"] == "src/conf.py" for f in pre), out)
+        self.assertTrue(any("k8s Secret data.DB_PASSWORD" in f["message"] for f in pre), out)
+        self.assertNoValue(out, old, val)
+
+    def test_a_new_secret_in_the_working_tree_blocks(self):
+        r = self.repo(CLEAN_PY)
+        r._git("branch", "base")
+        val = "pw-" + rnd(20)
+        r.write({"k8s/db.yaml": k8s_secret(("DB_PASSWORD", val))})
+        r._git("add", "k8s/db.yaml")  # staged, not committed: the tree sweep reads it
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        self.assertTrue(any("k8s Secret data.DB_PASSWORD" in f["message"] for f in findings(data, "secrets", "open")), out)
+
+    def test_merging_the_base_into_the_branch_does_not_block_on_its_old_secrets(self):
+        old, val = canary(), "pw-" + rnd(20)
+        r = self.repo(CLEAN_PY)
+        r._git("checkout", "-q", "-b", "feature")
+        self.step(r, {"src/calc.py": "def add(a, b):\n    return b + a\n"}, "feature work")
+        r._git("checkout", "-q", "main")
+        self.step(r, {"src/conf.py": f'TOKEN = "{old}"\n', "k8s/db.yaml": k8s_secret(("DB_PASSWORD", val))}, "main moves on")
+        r._git("checkout", "-q", "feature")
+        r._git("merge", "-q", "--no-ff", "--no-edit", "main")
+        code, out, data = self.scoped(r, "--base-ref", "main")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(findings(data, "secrets", "pre-existing"), out)
+        self.assertNoValue(out, old, val)
+
+    def test_default_base_is_the_merge_base_with_the_remote_default_branch(self):
+        old, new = canary(), canary()
+        r = self.repo(dict(CLEAN_PY, **{"src/old.py": f'TOKEN = "{old}"\n'}))
+        r._git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.step(r, {"src/calc.py": "def add(a, b):\n    return b + a\n"})
+        code, out, data = self.scoped(r)
+        self.assertEqual(code, 0, out)
+        self.assertIn("origin/main", out)
+        self.step(r, {"src/new.py": f'KEY = "{new}"\n'})
+        code, out, data = self.scoped(r)
+        self.assertEqual(code, 1, out)
+        self.assertTrue(all(f["path"] == "src/new.py" for f in findings(data, "secrets", "open")), out)
+
+    def test_unrelated_histories_is_cannot_tell(self):
+        # an orphan branch has no merge-base with HEAD: cannot tell, never a traceback and never a pass
+        r = self.repo(CLEAN_PY)
+        r._git("checkout", "-q", "--orphan", "other")
+        r.commit("an unrelated history")
+        r._git("checkout", "-q", "main")
+        code, out, data = self.scoped(r, "--base-ref", "other")
+        self.assertEqual(code, 2, out)
+        self.assertIn("unrelated histories", out)
+
+    def test_no_resolvable_base_is_cannot_tell(self):
+        r = self.repo(CLEAN_PY)  # no remote, no --base-ref
+        code, out, data = self.scoped(r)
+        self.assertEqual(code, 2, out)
+        self.assertEqual(status_of(data, "secrets"), "cannot-tell", out)
+        self.assertIn("base", out)
+
+    def test_an_unknown_base_ref_is_cannot_tell(self):
+        r = self.repo(CLEAN_PY)
+        r._git("update-ref", "refs/remotes/origin/main", "HEAD")  # a default exists, but the named ref wins
+        code, out, data = self.scoped(r, "--base-ref", "no-such-branch")
+        self.assertEqual(code, 2, out)
+        self.assertEqual(status_of(data, "secrets"), "cannot-tell", out)
+
+    def test_a_reviewed_fixture_in_gitleaksignore_still_passes(self):
+        r = self.repo(CLEAN_PY)
+        r._git("branch", "base")
+        self.step(r, {"tests/fixture_token.py": f'TOKEN = "{canary()}"\n'}, "fixture")
+        sha = subprocess.run(["git", "-C", str(r.path), "rev-parse", "HEAD"], capture_output=True, text=True,
+                             check=True).stdout.strip()
+        self.step(r, {".gitleaksignore": "# reviewed: the gate's own canary, a fake secret planted by a test\n"
+                                         f"{sha}:tests/fixture_token.py:estate-gate-canary:1\n"}, "ignore it")
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 0, out)
+
+    def test_secrets_still_cannot_be_baselined(self):
+        r = self.repo(CLEAN_PY)
+        r._git("branch", "base")
+        self.step(r, {"src/new.py": f'KEY = "{canary()}"\n'})
+        subprocess.run([sys.executable, "-m", "gate", "baseline", "--repo", str(r.path), "--only", "secrets", "--offline",
+                        "--base-ref", "base"], cwd=ROOT, check=True, capture_output=True, env=dict(os.environ, **self.env))
+        self.assertEqual(json.loads((r.path / ".gate-baseline.json").read_text(encoding="utf-8"))["entries"], [])
+        r.commit("baseline")
+        code, out, data = self.scoped(r, "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+
+
+class SecretsScopeHelpers(Base):
+    """The scope helpers directly, not through the CLI. The mutation smoke found three mutants of
+    secrets_scope.py that survived the CLI tests (a deleted path let through, a merge commit's shared
+    paths emptied, a path-less object line turned into an empty path); each test below is the case
+    that catches one."""
+
+    def repo(self, files: dict) -> GateRepo:
+        r = GateRepo(files)
+        self.addCleanup(r.close)
+        return r
+
+    def core(self, r: GateRepo):
+        from gate.core import Repo
+        return Repo(r.path)
+
+    def test_changed_blobs_skips_deletions_and_non_regular_files(self):
+        """A deleted path is not a changed blob, and neither is a symlink (mode 120000). The mutant
+        turns the skip into `status.startswith('D') and not mode.startswith('100')`, which lets a
+        deletion through carrying its old blob. The symlink goes in through the index
+        (`--cacheinfo 120000,...`) so the test does not need symlink privileges on Windows."""
+        r = self.repo({"keep.py": "A = 1\n", "gone.py": "B = 2\n"})
+        base = r._out("rev-parse", "HEAD")
+        (r.path / "_blob.txt").write_text("keep.py\n", encoding="utf-8", newline="\n")
+        link_blob = r._out("hash-object", "-w", "_blob.txt")
+        r._git("rm", "-q", "gone.py")
+        r._git("update-index", "--add", "--cacheinfo", f"120000,{link_blob},link.txt")
+        (r.path / "keep.py").write_text("A = 3\n", encoding="utf-8", newline="\n")
+        r._git("add", "keep.py")
+        r._git("commit", "-q", "-m", "delete one, symlink another")
+        from gate.checks.secrets_scope import changed_blobs
+        got = changed_blobs(self.core(r), base, "HEAD")
+        self.assertEqual(set(got), {"keep.py"}, got)
+
+    def test_commit_changes_of_a_merge_is_the_paths_every_parent_shares(self):
+        """A merge commit introduces only what differs from every parent. The mutant flips `k in d`
+        to `k not in d`, which makes a path introduced in one parent and not the other count as the
+        merge's own change."""
+        r = self.repo({"base.py": "X = 1\n"})
+        r._git("checkout", "-q", "-b", "left")
+        (r.path / "left.py").write_text("L = 1\n", encoding="utf-8", newline="\n")
+        r.commit("left adds left.py")
+        r._git("checkout", "-q", "main")
+        r._git("checkout", "-q", "-b", "right")
+        (r.path / "right.py").write_text("R = 1\n", encoding="utf-8", newline="\n")
+        r.commit("right adds right.py")
+        r._git("merge", "-q", "--no-ff", "-m", "merge left and right", "left")
+        from gate.checks.secrets_scope import commit_changes
+        ps, common = commit_changes(self.core(r), "HEAD")
+        self.assertEqual(len(ps), 2, ps)
+        self.assertEqual(common, {}, f"paths added on one side only are not the merge's own change: {common}")
+
+    def test_commit_changes_of_an_ordinary_commit_is_everything_it_touches(self):
+        """The same helper on a non-merge: with one parent, every path it changes is its own change.
+        (A merge-only test would pass with the mutant if that helper always returned {}.)"""
+        r = self.repo({"base.py": "X = 1\n"})
+        (r.path / "added.py").write_text("A = 1\n", encoding="utf-8", newline="\n")
+        r.commit("add one file")
+        from gate.checks.secrets_scope import commit_changes
+        ps, common = commit_changes(self.core(r), "HEAD")
+        self.assertEqual(len(ps), 1, ps)
+        self.assertEqual(set(common), {"added.py"}, common)
+
+    def test_reachable_blobs_maps_only_paths_and_never_an_empty_one(self):
+        """`rev-list --objects` also lists commits and trees, which have no path. The mutant turns
+        `path and sha not in out` into `path or ...`, so those lines land in the map under an empty
+        path, and a caller comparing blob shas then matches nothing useful."""
+        r = self.repo({"a.py": "A = 1\n", "copy.py": "A = 1\n"})
+        from gate.checks.secrets_scope import reachable_blobs
+        got = reachable_blobs(self.core(r), "HEAD")
+        self.assertTrue(got, got)
+        self.assertTrue(all(p for p in got.values()), f"an object with no path reached the map: {got}")
+        self.assertIn("a.py", got.values())
+        same = [p for p in got.values() if p in {"a.py", "copy.py"}]
+        self.assertEqual(len(same), 1, f"one blob sha is one entry, even at two paths: {got}")
 
 
 def _git_exe() -> str:
