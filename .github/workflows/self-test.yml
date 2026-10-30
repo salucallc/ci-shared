@@ -57,6 +57,12 @@ jobs:
           echo "GATE_GITLEAKS=${RUNNER_TEMP}/gitleaks" >> "$GITHUB_ENV"
       - name: Install pytest (the mutation fixtures run it)
         run: python -m pip install pytest==9.1.1
+      - name: Install bandit and semgrep (the versions pinned in gate/checks/sast.py; the SAST tests run them)
+        run: |
+          set -euo pipefail
+          b="$(python -c "import gate.checks.sast as s; print(s.BANDIT_VERSION)")"
+          g="$(python -c "import gate.checks.sast as s; print(s.SEMGREP_VERSION)")"
+          python -m pip install "bandit==${b}" "semgrep==${g}"
       - name: Gate tests (every check has a fixture that must fail)
         run: python -m unittest discover -s gate/tests -v
   merge-gate:

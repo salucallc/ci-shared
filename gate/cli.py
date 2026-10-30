@@ -3,9 +3,11 @@
   python -m gate run [--repo DIR] [--only a,b] [--json out.json] [--offline] [--deep]
   python -m gate fast FILE...          pre-commit: paths, control chars, style, secrets on files
   python -m gate baseline [--repo DIR] write .gate-baseline.json from today's blocking findings
+                                       (refused, exit 2, while any check it runs cannot tell)
   python -m gate detect                print python=/node= for the CI workflow
   python -m gate list                  the checks and their requirement ids
-  python -m gate bootstrap             fetch pinned gitleaks and a pip-audit venv into ~/.cache
+  python -m gate bootstrap             fetch pinned gitleaks, a pip-audit and bandit venv, and semgrep
+                                       (a venv, or its Docker image on Windows) into ~/.cache
 
 Exit codes: 0 green (warnings allowed), 1 a blocking finding, 2 cannot tell. Cannot tell is
 never a pass. A red gate is never pushed. The standard is saluca-handoff
@@ -25,7 +27,7 @@ import tomllib
 from pathlib import Path
 
 from .checks import (ci_hygiene, claims, consistency, control_chars, deps, docs, licence, log_redaction, mutation,
-                     packaging, paths, secrets, security, style, test_markers)
+                     packaging, paths, sast, secrets, security, style, test_markers)
 from .core import BLOCK, CANNOT, CI_ONLY, FAIL, NA, PASS, WARN, WARN_S, Repo, Result
 
 CHECKS = {  # name: (runner, requirement ids, kind)
@@ -44,12 +46,17 @@ CHECKS = {  # name: (runner, requirement ids, kind)
     "consistency": (consistency.run, "CON-1, CON-2", "change"),
     "docs": (docs.run, "DOC-1", "change"),
     "mutation": (mutation.run, "TST-5", "change"),
-    "sast": (None, "SEC-10", "ci-only"),
+    "bandit": (sast.run_bandit, "SEC-10", "change"),
+    "semgrep": (sast.run_semgrep, "SEC-10", "change"),
     "branch-protection": (ci_hygiene.run_protection, "CI-6", "settings"),
 }
 FAST = ("paths", "control-chars", "style", "secrets")
 NO_WAIVE = {"secrets"}  # a secret is rotated, never waived; reviewed gitleaks fixtures go in .gitleaksignore
 NO_BASELINE = {"secrets"}
+# Checks a version-2 baseline (no "checks" list) could not have evaluated: before 2026-10-30
+# SAST ran in CI only, so a v2 file never holds its debt. Their first entries are adoption, not
+# growth (GATE-3), exactly as a PR that adds the first baseline is.
+NOT_IN_V2 = {"bandit", "semgrep"}
 CONFIG_KEYS = {"gate": {"visibility"}, "claims": {"none"}, "docs": {"required-headings"},
                "mutation": {"targets", "test-command", "install-command", "max-mutants"}, "waive": None}
 ISSUE_URL = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/(issues|pull)/\d+$")
@@ -140,6 +147,14 @@ def baseline_path(repo: Repo) -> Path:
     return repo.root / ".gate-baseline.json"
 
 
+def covered(data: dict) -> set[str]:
+    """The checks a baseline file was written from. Version 3 lists them; older files were written
+    by a gate that evaluated every check except NOT_IN_V2."""
+    if isinstance(data.get("checks"), list):
+        return {str(c) for c in data["checks"]}
+    return set(CHECKS) - NOT_IN_V2 - NO_BASELINE
+
+
 def apply_baseline(repo: Repo, results: list[Result], cfg_result: Result, base_ref: str | None) -> None:
     p = baseline_path(repo)
     if not p.is_file():
@@ -154,11 +169,22 @@ def apply_baseline(repo: Repo, results: list[Result], cfg_result: Result, base_r
         try:
             old = json.loads(repo.git("show", f"{base_ref}:.gate-baseline.json"))
             old_entries = {(e["check"], entry_id(e)) for e in old.get("entries", [])}
-            grown = entries - old_entries
+            old_cov = covered(old)
+            new = entries - old_entries
+            # Entries for a check the base file never evaluated are that check's adoption, the same
+            # as a PR that adds the first baseline: the reviewer reads them. Growth is only ever
+            # measured for a check whose debt the base file already recorded.
+            grown = {(c, i) for (c, i) in new if c in old_cov}
+            adopted = sorted({c for (c, i) in new if c not in old_cov})
             if grown:
                 cfg_result.add(BLOCK, f"GATE-3: the baseline grew by {len(grown)} entr{'y' if len(grown) == 1 else 'ies'} "
                                f"against {base_ref}; debt may only shrink (new findings are fixed or waived with a reason)",
                                ".gate-baseline.json", key="grown")
+            if adopted:
+                n = len(new) - len(grown)
+                cfg_result.add(WARN, f"GATE-3: {n} baseline entr{'y' if n == 1 else 'ies'} for {', '.join(adopted)}, which "
+                               f"the baseline on {base_ref} never covered: this adopts {'it' if len(adopted) == 1 else 'them'}; "
+                               "list every entry in the PR body", ".gate-baseline.json", key="adopted")
         except RuntimeError:
             pass  # no baseline on the base branch: this PR adopts the gate, and the reviewer reads the file
         except (json.JSONDecodeError, KeyError, TypeError):
@@ -184,6 +210,68 @@ def apply_baseline(repo: Repo, results: list[Result], cfg_result: Result, base_r
                        "run `python -m gate baseline` to shrink the file", ".gate-baseline.json", key="stale")
 
 
+def write_baseline(repo: Repo, results: list[Result], cfg: Result, today: dt.date) -> int:
+    """`gate baseline`: record today's blocking findings as debt.
+
+    REFUSED WHILE ANY CHECK IT RAN CANNOT TELL. A check that could not run has no findings to
+    record, so a baseline written then omits its debt, and the first run that CAN evaluate it goes
+    red on everything it was never given. That is how tiresias-zt adopted the gate green with 989
+    entries and went red on main with 45 SAST findings. Nothing is written and the exit is 2.
+
+    A run with --only rewrites the entries of the checks it ran and keeps every other check's
+    entries, so recording one check's debt (`--only bandit,semgrep` after a pin move) does not
+    erase the rest. The file lists the checks it covers; GATE-3 measures growth against that.
+    """
+    blind = [r for r in results if r.status == CANNOT] + ([cfg] if cfg.status == CANNOT else [])
+    if blind:
+        print("gate baseline: REFUSED, nothing written. Cannot tell for: " +
+              "; ".join(f"{r.check} ({' '.join(r.notes)[:300]})" for r in blind), file=sys.stderr)
+        print("A baseline written now would omit their debt, and the first run that can evaluate them would go red. "
+              "Make every check runnable (`python tools/gate.py bootstrap`, Docker for semgrep on Windows), then rerun.",
+              file=sys.stderr)
+        return 2
+    ran = {r.check for r in results} - NO_BASELINE
+    kept, cov = [], set()
+    p = baseline_path(repo)
+    if p.is_file():
+        try:
+            old = json.loads(p.read_text(encoding="utf-8"))
+            kept = [{"check": e["check"], "id": entry_id(e), "path": e.get("path", "")}
+                    for e in old.get("entries", []) if e["check"] not in ran]
+            cov = covered(old) & set(CHECKS)
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+            print(f"gate baseline: REFUSED, nothing written. {p.name} is not valid, so the entries of the checks this "
+                  "run did not cover cannot be kept; fix or delete it", file=sys.stderr)
+            return 2
+    # ONE ENTRY PER FINDING. The id is a hash of check|path|message, so the same
+    # defect written twice in one file hashes to the same id; it used to be
+    # written twice as well. Matching is by id, so the second copy is debt the
+    # file claims and nothing can ever pay off, and it inflated every count.
+    seen, entries = {(e["check"], e["id"]) for e in kept}, list(kept)
+    for r in results:
+        if r.check in NO_BASELINE:
+            continue
+        for f in sorted(r.findings, key=lambda f: (f.path or "", f.ident())):
+            if f.severity != BLOCK or f.state != "open":
+                continue
+            key = (r.check, fid(f))
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"check": r.check, "id": key[1], "path": f.path})
+    cov = sorted((cov | ran) - NO_BASELINE)
+    p.write_text(json.dumps({"version": 3, "written": today.isoformat(),
+                             "rule": "debt may only shrink; see repo-merge-gate.md GATE-3",
+                             "note": "ids are hashes of each finding; run `python -m gate run` to see them",
+                             "checks": cov, "entries": entries}, indent=1) + "\n", encoding="utf-8", newline="\n")
+    print(f"wrote {p} with {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}, covering {len(cov)} check(s)")
+    missing = sorted((set(CHECKS) - NO_BASELINE) - set(cov))
+    if missing:
+        print(f"note: not covered: {', '.join(missing)}. This is not a complete adoption baseline; run "
+              "`gate baseline` without --only (or --only those checks) before adopting.")
+    return 0
+
+
 def visibility(repo: Repo, a) -> str | None:
     if a.visibility:
         return a.visibility
@@ -201,13 +289,6 @@ def run_checks(repo: Repo, names: list[str], a) -> list[Result]:
     results = []
     for name in names:
         fn, _ids, kind = CHECKS[name]
-        if fn is None:
-            r = Result(name, "Generic SAST: bandit and semgrep rulepacks")
-            r.forced = CI_ONLY
-            r.notes.append("runs in CI only (merge-gate.yml calls reusable-sast-python.yml and reusable-semgrep.yml); "
-                           "CI is the final verdict for this check")
-            results.append(r)
-            continue
         try:
             results.append(fn(repo, a))
         except Exception as e:  # noqa: BLE001 - a crashing check is cannot-tell, never a pass
@@ -299,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--offline", action="store_true", help="no network: online checks become cannot-tell")
     ap.add_argument("--deep", action="store_true", help="also pip download every PyPI package the README installs")
     ap.add_argument("--no-audit", dest="audit", action="store_false")
+    ap.add_argument("--no-sast", action="store_true", help="bootstrap: leave out semgrep")
     ap.add_argument("--no-history", action="store_true", help="secrets: tree only (pre-commit speed; never a push verdict)")
     ap.add_argument("--staged", action="store_true")
     ap.add_argument("--base-ref", help="the PR's base. Secrets: the change is merge-base(BASE, HEAD)..HEAD plus the working "
@@ -314,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.command == "bootstrap":
         from . import bootstrap
-        return bootstrap.main(a.files)
+        return bootstrap.main(a.files + ([] if a.audit else ["--no-audit"]) + (["--no-sast"] if a.no_sast else []))
     if a.command == "list":
         for name, (_fn, ids, kind) in CHECKS.items():
             print(f"{name:<19}{ids:<16}{kind}")
@@ -358,28 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         a.visibility = visibility(repo, a)
     results = run_checks(repo, names, a)
     if a.command == "baseline":
-        # ONE ENTRY PER FINDING. The id is a hash of check|path|message, so the same
-        # defect written twice in one file hashes to the same id; it used to be
-        # written twice as well. Matching is by id, so the second copy is debt the
-        # file claims and nothing can ever pay off, and it inflated every count.
-        seen, entries = set(), []
-        for r in results:
-            if r.check in NO_BASELINE:
-                continue
-            for f in sorted(r.findings, key=lambda f: (f.path or "", f.ident())):
-                if f.severity != BLOCK or f.state != "open":
-                    continue
-                key = (r.check, fid(f))
-                if key in seen:
-                    continue
-                seen.add(key)
-                entries.append({"check": r.check, "id": key[1], "path": f.path})
-        baseline_path(repo).write_text(json.dumps({"version": 2, "written": today.isoformat(),
-                                                   "rule": "debt may only shrink; see repo-merge-gate.md GATE-3",
-                                                   "note": "ids are hashes of each finding; run `python -m gate run` to see them",
-                                                   "entries": entries}, indent=1) + "\n", encoding="utf-8", newline="\n")
-        print(f"wrote {baseline_path(repo)} with {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}")
-        return 0
+        return write_baseline(repo, results, cfg, today)
     apply_waivers(results, ws)
     apply_baseline(repo, results, cfg, a.base_ref)
     for w in ws:

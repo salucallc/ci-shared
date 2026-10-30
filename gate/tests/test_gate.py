@@ -1330,5 +1330,265 @@ class GateConfig(Base):
         self.assertIn("the baseline grew", out)
 
 
+
+# --- SEC-10: bandit and semgrep, run by the gate and baselined like every other check ----------
+
+EXEC_PY = "def run(code):\n    exec(code)\n"  # bandit B102, medium severity, high confidence
+SHELL_INJECTION_WF = (  # semgrep run-shell-injection (ERROR): untrusted github context in a run step
+    "name: t\non: issues\npermissions: {}\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n"
+    "      - run: echo \"${{ github.event.issue.title }}\"\n")
+
+
+def no_tools_env(**extra) -> dict:
+    """A PATH holding git only, a HOME with an empty gate cache, and the tool variables pointed at
+    nothing: the gate can find no bandit, semgrep or docker."""
+    home = tempfile.mkdtemp(prefix="repogate-home-")
+    env = {"HOME": home, "USERPROFILE": home, "PATH": os.path.dirname(_git_exe()),
+           "GATE_BANDIT": str(Path(home) / "nope"), "GATE_SEMGREP": str(Path(home) / "nope")}
+    env.update(extra)
+    return env
+
+
+def baseline(repo: GateRepo, *args, env=None) -> subprocess.CompletedProcess:
+    e = dict(os.environ, PYTHONIOENCODING="utf-8", GITHUB_ACTIONS="false")
+    e.update(env or {})
+    return subprocess.run([sys.executable, "-m", "gate", "baseline", "--repo", str(repo.path), "--today", "2026-10-22",
+                           *args], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", env=e)
+
+
+def baseline_entries(repo: GateRepo) -> list[dict]:
+    return json.loads((repo.path / ".gate-baseline.json").read_text(encoding="utf-8"))["entries"]
+
+
+def matrix_checks(text: str) -> list[str]:
+    import re
+    m = re.search(r"check: \[([^\]]*)\]", text)
+    return [c.strip() for c in m.group(1).replace("\n", " ").split(",")] if m else []
+
+
+class Bandit(Base):
+    """These need bandit at the pinned version (`python -m gate bootstrap`, or on PATH). Without it
+    they FAIL: cannot tell is never a pass, and a skipped SAST test is how SAST went unjudged."""
+
+    def test_new_finding_blocks(self):
+        self.assertFails(dict(CLEAN_PY, **{"src/run.py": EXEC_PY}), "bandit", "B102")
+
+    def test_clean_python_passes(self):
+        self.assertPasses(CLEAN_PY, "bandit", allow=("pass",))
+
+    def test_nosec_with_a_reason_passes(self):
+        code = "def run(code):\n    exec(code)  # nosec B102 - the input is a compiled constant\n"
+        self.assertPasses(dict(CLEAN_PY, **{"src/run.py": code}), "bandit", allow=("pass",))
+
+    def test_baselined_finding_does_not_block_and_survives_a_line_move(self):
+        repo = GateRepo(dict(CLEAN_PY, **{"src/run.py": EXEC_PY}))
+        self.addCleanup(repo.close)
+        res = baseline(repo, "--only", "bandit", "--offline")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual([e["check"] for e in baseline_entries(repo)], ["bandit"])
+        repo.commit("baseline")
+        code, out, data = repo.gate("--only", "bandit", "--offline")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(status_of(data, "bandit"), "warn", out)  # visible as debt, not silent
+        # the fingerprint carries no line number: moving the code keeps the entry
+        repo.write({"src/run.py": "import os\n\n\nX = os.sep\n\n\n" + EXEC_PY})
+        repo.commit("move it")
+        code, out, _ = repo.gate("--only", "bandit", "--offline")
+        self.assertEqual(code, 0, out)
+        # a NEW finding beside the baselined one blocks
+        repo.write({"src/run2.py": "def go(src):\n    eval(src)\n"})
+        repo.commit("new debt")
+        code, out, data = repo.gate("--only", "bandit", "--offline")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(len(open_blocks(data, "bandit")), 1, out)
+
+    def test_editing_a_baselined_line_makes_it_new(self):
+        repo = GateRepo(dict(CLEAN_PY, **{"src/run.py": EXEC_PY}))
+        self.addCleanup(repo.close)
+        self.assertEqual(baseline(repo, "--only", "bandit", "--offline").returncode, 0)
+        repo.commit("baseline")
+        repo.write({"src/run.py": "def run(code):\n    exec(code, {})\n"})
+        repo.commit("touch it")
+        code, out, _ = repo.gate("--only", "bandit", "--offline")
+        self.assertEqual(code, 1, out)
+
+    def test_missing_bandit_is_cannot_tell(self):
+        code, out, data = self.run_gate(dict(CLEAN_PY, **{"src/run.py": EXEC_PY}), "--only", "bandit", "--offline",
+                                        env=no_tools_env())
+        self.assertEqual(code, 2, out)
+        self.assertEqual(status_of(data, "bandit"), "cannot-tell", out)
+
+    def test_wrong_bandit_version_is_cannot_tell(self):
+        d = Path(tempfile.mkdtemp(prefix="repogate-fake-"))
+        if os.name == "nt":
+            fake = d / "bandit.bat"
+            fake.write_text("@echo bandit 1.0.0\n", encoding="utf-8")
+        else:
+            fake = d / "bandit"
+            fake.write_text("#!/bin/sh\necho bandit 1.0.0\n", encoding="utf-8")
+            fake.chmod(0o755)
+        code, out, data = self.run_gate(dict(CLEAN_PY, **{"src/run.py": EXEC_PY}), "--only", "bandit", "--offline",
+                                        env=no_tools_env(GATE_BANDIT=str(fake)))
+        self.assertEqual(code, 2, out)
+        self.assertIn("is 1.0.0", out)
+
+
+class Semgrep(Base):
+    """These need semgrep at the pinned version (on PATH, in the gate cache, or Docker) and the
+    registry. Without either they FAIL, never skip."""
+
+    def test_new_finding_blocks_and_a_baselined_one_does_not(self):
+        repo = GateRepo(dict(CLEAN_PY, **{".github/workflows/t.yml": SHELL_INJECTION_WF}))
+        self.addCleanup(repo.close)
+        code, out, data = repo.gate("--only", "semgrep")
+        self.assertEqual(code, 1, out)
+        self.assertTrue(any("run-shell-injection" in m for m in open_blocks(data, "semgrep")), out)
+        res = baseline(repo, "--only", "semgrep")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        repo.commit("baseline")
+        code, out, data = repo.gate("--only", "semgrep")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(status_of(data, "semgrep"), "warn", out)
+
+    def test_missing_semgrep_is_cannot_tell(self):
+        code, out, data = self.run_gate(CLEAN_PY, "--only", "semgrep", env=no_tools_env())
+        self.assertEqual(code, 2, out)
+        self.assertEqual(status_of(data, "semgrep"), "cannot-tell", out)
+        self.assertIn("semgrep 1.160.0 not found", out)
+
+    def test_offline_is_cannot_tell(self):
+        code, out, data = self.run_gate(CLEAN_PY, "--only", "semgrep", "--offline")
+        self.assertEqual(code, 2, out)
+        self.assertEqual(status_of(data, "semgrep"), "cannot-tell", out)
+
+
+class BaselineAdoption(Base):
+    def test_baseline_is_refused_while_sast_cannot_run(self):
+        """THE TIRESIAS-ZT ADOPTION. A baseline written while bandit or semgrep cannot run holds
+        none of their debt; the first run that can evaluate them goes red on all of it."""
+        repo = GateRepo(dict(CLEAN_PY, **{"src/run.py": EXEC_PY}))
+        self.addCleanup(repo.close)
+        res = baseline(repo, "--only", "paths,bandit,semgrep", env=no_tools_env())
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("REFUSED", res.stderr)
+        self.assertIn("bandit", res.stderr)
+        self.assertIn("semgrep", res.stderr)
+        self.assertFalse((repo.path / ".gate-baseline.json").exists())
+
+    def test_baseline_is_refused_while_any_check_cannot_tell_and_the_old_file_stands(self):
+        repo = GateRepo(dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\n', "requirements.txt": "requests==2.32.3\n"}))
+        self.addCleanup(repo.close)
+        self.assertEqual(baseline(repo, "--only", "paths", "--offline").returncode, 0)
+        before = (repo.path / ".gate-baseline.json").read_bytes()
+        res = baseline(repo, "--only", "paths,deps", "--offline", env=no_tools_env())  # deps: no pip-audit
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("REFUSED", res.stderr)
+        self.assertEqual((repo.path / ".gate-baseline.json").read_bytes(), before)
+
+    def test_a_partial_baseline_keeps_the_other_checks_entries(self):
+        repo = GateRepo(dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\n', "src/run.py": EXEC_PY}))
+        self.addCleanup(repo.close)
+        self.assertEqual(baseline(repo, "--only", "paths", "--offline").returncode, 0)
+        res = baseline(repo, "--only", "bandit", "--offline")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(sorted(e["check"] for e in baseline_entries(repo)), ["bandit", "paths"])
+        self.assertIn("not covered", res.stdout)  # a partial baseline says it is not an adoption
+
+    def _v2_base(self, files):
+        """A repo whose base branch holds a version-2 baseline (written before SAST ran locally)."""
+        repo = GateRepo(files)
+        self.addCleanup(repo.close)
+        self.assertEqual(baseline(repo, "--only", "paths", "--offline").returncode, 0)
+        p = repo.path / ".gate-baseline.json"
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["version"] = 2
+        data.pop("checks", None)
+        p.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8", newline="\n")
+        repo.commit("v2 baseline")
+        repo._git("branch", "base")
+        return repo
+
+    def test_sast_entries_against_a_v2_base_are_adoption_not_growth(self):
+        repo = self._v2_base(dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\n', "src/run.py": EXEC_PY}))
+        self.assertEqual(baseline(repo, "--only", "bandit", "--offline").returncode, 0)
+        repo.commit("adopt bandit")
+        code, out, _ = repo.gate("--only", "bandit", "--offline", "--base-ref", "base")
+        self.assertEqual(code, 0, out)
+        self.assertIn("adopts it", out)
+        self.assertNotIn("grew", out)
+
+    def test_growth_in_a_check_the_base_covered_still_blocks(self):
+        """ANTI-VACUITY for the rule above: coverage only exempts a check the base never judged."""
+        repo = self._v2_base(dict(CLEAN_PY, **{"src/io.py": 'P = "D:/x/y"\n'}))
+        repo.write({"src/io2.py": 'Q = "E:/new/debt"\n'})
+        repo.commit("new paths debt")  # the gate reads tracked files only
+        self.assertEqual(baseline(repo, "--only", "paths", "--offline").returncode, 0)
+        repo.commit("grow paths")
+        code, out, _ = repo.gate("--only", "paths", "--offline", "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        self.assertIn("the baseline grew", out)
+        # and once a v3 base covers bandit, bandit growth blocks too
+        repo2 = GateRepo(dict(CLEAN_PY, **{"src/run.py": EXEC_PY}))
+        self.addCleanup(repo2.close)
+        self.assertEqual(baseline(repo2, "--only", "bandit", "--offline").returncode, 0)
+        repo2.commit("v3 baseline")
+        repo2._git("branch", "base")
+        repo2.write({"src/run2.py": "def go(src):\n    eval(src)\n"})
+        repo2.commit("new bandit debt")
+        self.assertEqual(baseline(repo2, "--only", "bandit", "--offline").returncode, 0)
+        repo2.commit("grow bandit")
+        code, out, _ = repo2.gate("--only", "bandit", "--offline", "--base-ref", "base")
+        self.assertEqual(code, 1, out)
+        self.assertIn("the baseline grew", out)
+
+
+class SastCiParity(unittest.TestCase):
+    """CI and a local run must judge SAST with the same code, pins and baseline. How they
+    disagreed before: merge-gate.yml called the standalone reusable SAST workflows, which scan the
+    whole tree and never read .gate-baseline.json, while the gate listed SAST as ci-only."""
+
+    WF = ROOT / ".github" / "workflows"
+
+    def test_merge_gate_runs_bandit_and_semgrep_through_the_gate(self):
+        import re
+        text = (self.WF / "merge-gate.yml").read_text(encoding="utf-8")
+        checks = matrix_checks(text)
+        self.assertIn("bandit", checks)
+        self.assertIn("semgrep", checks)
+        # the matrix step is `python -m gate run --only "$CHECK"`, which applies .gate-baseline.json
+        self.assertIn('args=(run --repo . --only "$CHECK"', text)
+        uses = re.findall(r"uses:\s*(\S+)", text)
+        self.assertFalse([u for u in uses if "reusable-sast-python" in u or "reusable-semgrep" in u], uses)
+        # and CI installs the pin from the gate code, not a second copy of it
+        self.assertIn("s.BANDIT_VERSION if os.environ['CHECK'] == 'bandit' else s.SEMGREP_VERSION", text)
+
+    def test_every_gate_check_is_a_ci_job(self):
+        sys.path.insert(0, str(ROOT))
+        from gate.cli import CHECKS
+        checks = set(matrix_checks((self.WF / "merge-gate.yml").read_text(encoding="utf-8")))
+        self.assertEqual(set(CHECKS) - {"docs"}, checks)  # docs runs as its own job (repo-docs.yml)
+
+    def test_standalone_sast_workflow_defaults_are_the_gate_pins(self):
+        import re
+        sys.path.insert(0, str(ROOT))
+        from gate.checks import sast
+
+        def default(text, name):
+            m = re.search(rf"\n      {name}:\n(?:        .*\n)*?        default: (.+)\n", text)
+            self.assertIsNotNone(m, name)
+            return m.group(1).strip().strip('"')
+
+        b = (self.WF / "reusable-sast-python.yml").read_text(encoding="utf-8")
+        self.assertEqual(default(b, "bandit-version"), sast.BANDIT_VERSION)
+        self.assertEqual(default(b, "severity-level"), sast.BANDIT_SEVERITY)
+        self.assertEqual(default(b, "confidence-level"), sast.BANDIT_CONFIDENCE)
+        self.assertIn('pip install "bandit==${BANDIT_VERSION}"', b)
+        g = (self.WF / "reusable-semgrep.yml").read_text(encoding="utf-8")
+        self.assertEqual(default(g, "semgrep-version"), sast.SEMGREP_VERSION)
+        self.assertEqual(default(g, "severity"), sast.SEMGREP_SEVERITY)
+        cfg = re.search(r"default: \|\n((?:          \S.*\n)+)", g).group(1).split()
+        self.assertEqual(tuple(cfg), sast.SEMGREP_CONFIGS)
+
+
 if __name__ == "__main__":
     unittest.main()

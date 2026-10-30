@@ -1,8 +1,10 @@
 """Fetch the gate's pinned tools into ~/.cache/saluca-gate, checksum-verified.
 
 gitleaks comes from its GitHub release and is checked against the SHA-256 published in the
-release's checksums file (pinned here, the same pin CI uses). pip-audit is installed into a
-dedicated venv under the cache, never into the global Python.
+release's checksums file (pinned here, the same pin CI uses). pip-audit and bandit are installed
+into a dedicated venv under the cache, never into the global Python. semgrep gets its own venv
+(it is large); it has no native Windows build, so on Windows the gate runs the official
+semgrep/semgrep image under Docker instead, and bootstrap pulls that image.
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ import venv
 import zipfile
 from pathlib import Path
 
+from .checks.sast import BANDIT_VERSION, SEMGREP_IMAGE, SEMGREP_VERSION
 from .checks.secrets import GITLEAKS_VERSION
 
 CACHE = Path.home() / ".cache" / "saluca-gate"
@@ -73,14 +76,32 @@ def audit_venv() -> Path:
     py = vdir / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
     if not py.is_file():
         venv.EnvBuilder(with_pip=True).create(vdir)
-    subprocess.run([str(py), "-m", "pip", "install", "-q", PIP_AUDIT], check=True)
+    subprocess.run([str(py), "-m", "pip", "install", "-q", PIP_AUDIT, f"bandit=={BANDIT_VERSION}"], check=True)
     return py
+
+
+def semgrep() -> str:
+    if platform.system() == "Windows":
+        import shutil
+        docker = shutil.which("docker")
+        if not docker:
+            return f"not installed: semgrep has no native Windows build; install Docker, then rerun to pull {SEMGREP_IMAGE}"
+        subprocess.run([docker, "pull", "-q", SEMGREP_IMAGE], check=True)
+        return f"docker image {SEMGREP_IMAGE}"
+    vdir = CACHE / f"semgrep-{SEMGREP_VERSION}"
+    py = vdir / "bin/python"
+    if not py.is_file():
+        venv.EnvBuilder(with_pip=True).create(vdir)
+    subprocess.run([str(py), "-m", "pip", "install", "-q", f"semgrep=={SEMGREP_VERSION}"], check=True)
+    return str(vdir / "bin/semgrep")
 
 
 def main(args: list[str]) -> int:
     print(f"gitleaks: {gitleaks()}")
     if "--no-audit" not in args:
-        print(f"pip-audit venv: {audit_venv()}")
+        print(f"pip-audit and bandit venv: {audit_venv()}")
+    if "--no-sast" not in args:
+        print(f"semgrep: {semgrep()}")
     return 0
 
 
