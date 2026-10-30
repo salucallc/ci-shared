@@ -3,6 +3,10 @@
 # Derived from salucallc/gmail-mcp .github/workflows/ci.yml (semgrep job).
 # Semgrep version is pinned at workflow level (Dependabot does not bump
 # pip-installed tools inside workflows). Bump in lockstep with rulepack review.
+#
+# Standalone use only. It scans the whole tree and does NOT read .gate-baseline.json. The merge
+# gate (merge-gate.yml) runs semgrep through gate/checks/sast.py instead, which does. Its version,
+# configs and severity are held equal to this file's defaults by a test in gate/tests/test_gate.py.
 
 name: Reusable - Semgrep
 

@@ -25,8 +25,9 @@ standard-library Python helpers in `tools/`. It is not a library, an action or a
 ## The only numbers to trust
 
 - Pinned tool versions: actionlint and yamllint in `.github/workflows/self-validate.yml`, gitleaks in
-  `.github/workflows/repo-docs.yml`, semgrep in the `semgrep-version` default of
-  `.github/workflows/reusable-semgrep.yml`. Read them from those files, not from prose.
+  `.github/workflows/repo-docs.yml`, bandit and semgrep for the merge gate in `gate/checks/sast.py`
+  (the standalone `reusable-sast-python.yml` and `reusable-semgrep.yml` defaults must equal them; a
+  test checks). Read them from those files, not from prose.
 - Action pins: the `uses: ...@<sha>  # vX.Y.Z` lines in each workflow file.
 - The list of workflows: `ls .github/workflows/`.
 
@@ -45,6 +46,7 @@ actionlint
 python tools/write_caller.py --help
 python -m gate bootstrap --no-audit          # once: pinned gitleaks into ~/.cache/saluca-gate
 python -m pip install pytest==9.1.1           # in a venv; the mutation fixtures run pytest
+python -m pip install bandit==1.9.4 semgrep==1.160.0   # in the venv; the SAST tests run them (Windows: Docker for semgrep)
 python -m unittest discover -s gate/tests -v  # the merge gate's own tests
 python tools/gate.py run --repo .             # the gate on this repo
 ```

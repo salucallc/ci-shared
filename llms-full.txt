@@ -112,8 +112,8 @@ Every workflow below also takes `runs-on` (default `ubuntu-24.04`).
 |---|---|---|
 | `reusable-lint-dockerfile.yml` | Hadolint Dockerfile lint | `dockerfile` (default `Dockerfile`), `failure-threshold` (default `warning`) |
 | `reusable-dep-scan-python.yml` | pip-audit + safety CVE matrix | `requirements-file` (default `requirements.txt`), `python-version` (default `3.12`) |
-| `reusable-sast-python.yml` | Bandit SAST | `target-paths` (default `.`), `severity-level` (default `medium`), `confidence-level` (default `medium`) |
-| `reusable-semgrep.yml` | Semgrep OWASP/Python/secrets/CI rulepacks | `configs` (default set), `severity` (default `ERROR`), `semgrep-version` (default `1.160.0`) |
+| `reusable-sast-python.yml` | Bandit SAST, standalone, without the gate baseline (the merge gate runs its own `bandit` check) | `target-paths` (default `.`), `severity-level` (default `medium`), `confidence-level` (default `medium`), `bandit-version` (default `1.9.4`, was unpinned before 2026-10-30) |
+| `reusable-semgrep.yml` | Semgrep OWASP/Python/secrets/CI rulepacks, standalone, without the gate baseline (the merge gate runs its own `semgrep` check) | `configs` (default set), `severity` (default `ERROR`), `semgrep-version` (default `1.160.0`) |
 | `reusable-secret-scan.yml` | TruffleHog verified-only secret scan | `only-verified` (default `true`), `scan-path` (default `./`) |
 | `reusable-build-smoke-docker.yml` | Buildx smoke build of a Dockerfile | `context` (default `.`), `dockerfile` (default `Dockerfile`), `image-name` |
 | `reusable-image-cve-scan.yml` | Rebuilds the image locally, then a Trivy scan | `context`, `dockerfile`, `image-name`, `severity` (default `HIGH,CRITICAL`), `ignore-unfixed` (default `true`), `vuln-type` (default `os,library`) |
@@ -121,7 +121,7 @@ Every workflow below also takes `runs-on` (default `ubuntu-24.04`).
 | `reusable-python-ci.yml` | Install (uv / poetry / pip, from the lockfile), `compileall`, `pytest` when tests exist | `python-version` (default `3.12`), `working-directory`, `install-command`, `compile-command`, `test-command`, `extra-packages`, `apt-packages` |
 | `reusable-node-ci.yml` | Install (npm / pnpm / yarn, frozen lockfile), typecheck, build, test | `node-version` (default `22`), `working-directory`, `install-command`, `typecheck-command`, `build-command`, `test-command` |
 | `repo-docs.yml` | README and `llms.txt` shape check, em-dash check, gitleaks over full history | `required-headings`, `check-em-dash` (default `true`), `run-gitleaks` (default `true`) |
-| `merge-gate.yml` | The merge gate: every automated check of the estate merge standard, one job each, plus a fan-in (`Merge gate all`) | `gate-ref` (the same SHA as `uses:`), `python-ci`, `node-ci` (`auto` or `skip`), `sast` (default `true`) |
+| `merge-gate.yml` | The merge gate: every automated check of the estate merge standard, one job each, plus a fan-in (`Merge gate all`) | `gate-ref` (the same SHA as `uses:`), `python-ci`, `node-ci` (`auto` or `skip`), `sast` (default `true`; `false` skips the `bandit` and `semgrep` jobs with a notice, and a local run still judges them) |
 
 The two stack workflows take `auto`, `skip` or a shell command for each step. `auto` detects from
 the repo; `skip` logs that the step did not run. A step that found nothing to run says so with a
@@ -221,10 +221,51 @@ What each job checks (the requirement ids are the standard's):
 | `consistency` | CON-1, CON-2 | warnings only: a home-grown hash chain, or one with no truncation test (the estate format is an open decision) |
 | `mutation` | TST-5 | opt-in: no mutant of a declared target is caught, so its tests pass whatever the code does |
 | `docs` | DOC-1 | `repo-docs.yml`, called with its em-dash and gitleaks steps off because `style` and `secrets` cover them |
-| `python-tests`, `node-tests`, `bandit`, `semgrep` | TST-1, SEC-10 | the existing stack and SAST workflows, called when the stack is detected |
+| `bandit` | SEC-10 | bandit 1.9.4 (medium severity and confidence, the same thresholds as `reusable-sast-python.yml`) flags a tracked Python file. A `# nosec <id>` with a reason suppresses one line |
+| `semgrep` | SEC-10 | semgrep 1.160.0 with `p/owasp-top-ten`, `p/python`, `p/secrets` and `p/ci` at `ERROR` (the same as `reusable-semgrep.yml`) flags a tracked file. A `# nosemgrep: <rule-id>` with a reason suppresses one line |
+| `python-tests`, `node-tests` | TST-1 | the existing stack workflows, called when the stack is detected |
 
 The gate fails closed. A tool it cannot run, a registry it cannot reach, or a file it cannot read
 is cannot-tell (exit 2), which fails the gate, never a pass.
+
+##### SAST runs in the gate, and is baselined like everything else
+
+Until 2026-10-30 `merge-gate.yml` ran bandit and semgrep by calling `reusable-sast-python.yml` and
+`reusable-semgrep.yml`, which scan the whole tree with no knowledge of `.gate-baseline.json`, while a
+local `gate run` listed SAST as `ci-only`. A repo could adopt the gate on a green local run and go
+red on main the moment CI scanned it (tiresias-zt: 989 baseline entries, then 45 SAST findings).
+
+Now `bandit` and `semgrep` are gate checks (`gate/checks/sast.py`), and the CI jobs run
+`python -m gate run --only bandit` and `--only semgrep`: the same code, the same pins and the same
+baseline as a local run, so the two verdicts cannot disagree. CI installs the version pinned in
+`sast.py`; a test holds the standalone workflows' defaults to the same pins.
+
+- **Fingerprints carry no line number.** A finding's id is the tool, the rule, the path and a hash
+  of the flagged source text with whitespace collapsed. Moving code keeps its baseline entry;
+  editing a flagged line makes it a new finding, which blocks.
+- **Only tracked files count**, after the gate's constant exclusions, so a local run and a CI
+  checkout scan the same set.
+- **Missing, wrong version, or unable to run is cannot tell** (exit 2). Locally, `python tools/gate.py
+  bootstrap` installs bandit into the gate's cache venv, and semgrep into its own (on Windows, which
+  semgrep does not support natively, it pulls the `semgrep/semgrep:1.160.0` image and the gate runs
+  it under Docker). `GATE_BANDIT` and `GATE_SEMGREP` name a binary explicitly. Semgrep fetches its
+  rulepacks from the registry, so `--offline` makes it cannot tell.
+- **`gate baseline` refuses while any check it runs cannot tell.** It writes nothing and exits 2,
+  because a baseline written while a check cannot run holds none of that check's debt, and the
+  first run that can evaluate it goes red on all of it.
+- **The baseline file lists the checks it covers** (version 3, `"checks"`). `--only` rewrites the
+  entries of the checks it ran and keeps every other check's. GATE-3 (the baseline may only shrink)
+  is measured per covered check: entries for a check the base branch's baseline never covered are
+  that check's adoption, printed as a warning, the same as a PR that adds the first baseline. A
+  version 2 file (written before this change) covers every check except `bandit` and `semgrep`.
+
+**When a consumer moves its pin past this change:** run
+`python <ci-shared>/tools/gate.py run --repo . --only bandit,semgrep`. Fix what is real, annotate
+reviewed false positives inline with a reason, and record the rest with
+`python <ci-shared>/tools/gate.py baseline --repo . --only bandit,semgrep`; list every new entry in
+the PR body. Nothing changes for a consumer until its pin moves. One behaviour change to expect:
+the old `bandit` job ran only when a Python manifest was detected; the `bandit` check runs whenever
+the repo tracks a `.py` file.
 
 ##### Reviewed fixtures: two files, two checks
 
@@ -266,7 +307,7 @@ is not excluded, so a real-looking value written there is still a finding.
 Run it before a push (Python 3.11+, standard library only):
 
 ```console
-$ python tools/gate.py bootstrap          # once: pinned gitleaks and a pip-audit venv in ~/.cache/saluca-gate
+$ python tools/gate.py bootstrap          # once: pinned gitleaks, a pip-audit and bandit venv, and semgrep, in ~/.cache/saluca-gate
 $ python tools/gate.py run --repo ../my-repo
 ```
 
@@ -363,7 +404,7 @@ The files:
 #### Pinning policy
 
 - Third-party actions pinned to a **commit SHA**, never a tag.
-- Pinned tools fetched inside workflows (e.g. `semgrep==1.160.0`, actionlint, gitleaks) are bumped in follow-up PRs alongside rulepack review; release binaries are checked against a pinned SHA-256.
+- Pinned tools fetched inside workflows (e.g. `semgrep==1.160.0`, `bandit==1.9.4`, actionlint, gitleaks) are bumped in follow-up PRs alongside rulepack review; release binaries are checked against a pinned SHA-256. The merge gate's SAST pins live in `gate/checks/sast.py`; bump them there and in the standalone workflows' defaults together (a test fails otherwise).
 - Dependabot is configured for the `github-actions` ecosystem only, weekly.
 
 #### Citation
@@ -411,8 +452,9 @@ standard-library Python helpers in `tools/`. It is not a library, an action or a
 #### The only numbers to trust
 
 - Pinned tool versions: actionlint and yamllint in `.github/workflows/self-validate.yml`, gitleaks in
-  `.github/workflows/repo-docs.yml`, semgrep in the `semgrep-version` default of
-  `.github/workflows/reusable-semgrep.yml`. Read them from those files, not from prose.
+  `.github/workflows/repo-docs.yml`, bandit and semgrep for the merge gate in `gate/checks/sast.py`
+  (the standalone `reusable-sast-python.yml` and `reusable-semgrep.yml` defaults must equal them; a
+  test checks). Read them from those files, not from prose.
 - Action pins: the `uses: ...@<sha>  # vX.Y.Z` lines in each workflow file.
 - The list of workflows: `ls .github/workflows/`.
 
@@ -431,6 +473,7 @@ actionlint
 python tools/write_caller.py --help
 python -m gate bootstrap --no-audit          # once: pinned gitleaks into ~/.cache/saluca-gate
 python -m pip install pytest==9.1.1           # in a venv; the mutation fixtures run pytest
+python -m pip install bandit==1.9.4 semgrep==1.160.0   # in the venv; the SAST tests run them (Windows: Docker for semgrep)
 python -m unittest discover -s gate/tests -v  # the merge gate's own tests
 python tools/gate.py run --repo .             # the gate on this repo
 ```

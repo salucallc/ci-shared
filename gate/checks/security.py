@@ -10,8 +10,8 @@ SEC-8  code writes another tool's user config (~/.claude, ~/.cursor, ~/.config, 
        MCP configs, .gitconfig, .npmrc), or an installer writes anything under the home
        directory, without both a consent prompt and a backup in the same file.
 
-Generic SAST (bandit, semgrep rulepacks) runs in CI through reusable-sast-python.yml and
-reusable-semgrep.yml; this module covers what those rulepacks do not express.
+Generic SAST (bandit, semgrep rulepacks) is SEC-10, the bandit and semgrep checks in sast.py;
+this module covers what those rulepacks do not express.
 """
 from __future__ import annotations
 
@@ -304,5 +304,5 @@ def run(repo: Repo, opts) -> Result:
             r.add(sev, msg, rel, ln, key=f"{rel}|{msg[:40]}|{src[:80]}")
     auth_findings(repo, files, r)
     config_write_findings(repo, files, r)
-    r.notes.append("generic SAST (bandit, semgrep) runs in CI via reusable-sast-python.yml and reusable-semgrep.yml")
+    r.notes.append("generic SAST (bandit, semgrep) is SEC-10: the bandit and semgrep checks")
     return r

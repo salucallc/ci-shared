@@ -3,6 +3,10 @@
 # Derived from salucallc/gmail-mcp .github/workflows/ci.yml (sast-python job).
 # Default severity/confidence thresholds match the gmail-mcp baseline (medium/medium);
 # bump to high/high once the backlog is triaged.
+#
+# Standalone use only. It scans the whole tree and does NOT read .gate-baseline.json. The merge
+# gate (merge-gate.yml) runs bandit through gate/checks/sast.py instead, which does. Its version
+# and thresholds are held equal to this file's defaults by a test in gate/tests/test_gate.py.
 
 name: Reusable - Python SAST (bandit)
 
@@ -24,6 +28,11 @@ on:
         type: string
         required: false
         default: medium
+      bandit-version:
+        description: "Pinned bandit version (the same pin as BANDIT_VERSION in gate/checks/sast.py)."
+        type: string
+        required: false
+        default: "1.9.4"
       python-version:
         description: "Python version to set up for bandit."
         type: string
@@ -50,10 +59,12 @@ jobs:
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: ${{ inputs.python-version }}
-      - name: Install bandit
+      - name: Install bandit (pinned)
+        env:
+          BANDIT_VERSION: ${{ inputs.bandit-version }}
         run: |
           python -m pip install --upgrade pip
-          pip install bandit
+          pip install "bandit==${BANDIT_VERSION}"
       - name: Run bandit
         env:
           TARGETS: ${{ inputs.target-paths }}
