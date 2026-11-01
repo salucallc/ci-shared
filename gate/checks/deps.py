@@ -1,7 +1,9 @@
 """DEP-1..DEP-3: dependencies are pinned and audited.
 
 DEP-1  a Node project with dependencies has a lockfile (block): without one, `npm ci` cannot run
-       and `npm audit` has nothing to read.
+       and `npm audit` has nothing to read. In a workspace (one root `package.json` declaring
+       `workspaces`, one lockfile at that root) a member is covered by the root's lockfile: a
+       second lockfile inside a member is the bug, not the fix.
 DEP-2  Python requirements are pinned (`==`, or a lockfile: uv.lock, poetry.lock, pdm.lock);
        an unpinned line is a warning.
 DEP-3  with --audit (the default in CI and before a push): pip-audit over each requirements file
@@ -30,6 +32,79 @@ def pip_audit_cmd() -> list[str] | None:
     return None
 
 
+NODE_LOCKS = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock")
+
+
+def _seg_match(pattern: str, parts: list[str]) -> bool:
+    """Does one workspace glob match this path, segment by segment?
+
+    `*` matches within one segment and never across `/`, `**` matches zero or more whole segments.
+    A plain `fnmatch` would let `packages/*` swallow `packages/a/b`, which npm does not: that would
+    report a member as covered when it is not, and a false pass here hides an unpinned repo.
+    """
+    if pattern == "**" or pattern.startswith("**/"):
+        rest = "" if pattern == "**" else pattern[3:]
+        return any(_seg_match(rest, parts[i:]) for i in range(len(parts) + 1))
+    if not parts:
+        return not pattern
+    if not pattern:
+        return False
+    head, _, tail = pattern.partition("/")
+    if not head:
+        return False
+    return re.fullmatch(re.escape(head).replace(r"\*", "[^/]*").replace(r"\?", "[^/]"), parts[0]) is not None \
+        and _seg_match(tail, parts[1:])
+
+
+def _workspace_patterns(data: dict) -> list[str] | None:
+    """The `workspaces` globs a package.json declares, or None when it declares none.
+
+    `workspaces` is a list, or an object whose `packages` key is the list (Yarn Berry). Anything
+    else is a shape this check does not understand, and the caller must not read that as "covered".
+    """
+    ws = data.get("workspaces")
+    if ws is None:
+        return None
+    if isinstance(ws, dict):
+        ws = ws.get("packages")
+        if ws is None:
+            return []
+    if isinstance(ws, str):
+        ws = [ws]
+    if not isinstance(ws, list) or not all(isinstance(p, str) for p in ws):
+        return []
+    return [p.strip().strip("/") for p in ws if p.strip()]
+
+
+def _workspace_lock(pj: str, repo: Repo, names: set[str]) -> str:
+    """The root lockfile of the workspace `pj` is a member of, or ''.
+
+    Walks up from the member to the repo root looking for an ancestor `package.json` that declares
+    `workspaces` covering this path. Both the declaration and the coverage are required, so a
+    package.json merely sitting above a member proves nothing.
+    """
+    parts = PurePosixPath(pj).parts[:-1]
+    for cut in range(len(parts) - 1, -1, -1):
+        parent_dir = "/".join(parts[:cut])
+        parent_pj = (parent_dir + "/" if parent_dir else "") + "package.json"
+        if parent_pj == pj or (parent_pj not in names and not (repo.root / parent_pj).is_file()):
+            continue
+        try:
+            parent = json.loads(repo.text(parent_pj) or "{}")
+        except json.JSONDecodeError:
+            continue
+        globs = _workspace_patterns(parent)
+        if not globs:
+            continue
+        rel = parts[cut:]
+        if not any(_seg_match(g, rel) for g in globs):
+            continue
+        root = parent_dir + "/" if parent_dir else ""
+        lock = next((root + n for n in NODE_LOCKS if root + n in names or (repo.root / (root + n)).is_file()), None)
+        return lock or ""
+    return ""
+
+
 def run(repo: Repo, opts) -> Result:
     r = Result("deps", "Dependencies pinned (lockfiles) and audited (pip-audit, npm audit)")
     files = repo.tracked()
@@ -49,12 +124,14 @@ def run(repo: Repo, opts) -> Result:
             r.add(BLOCK, "DEP-1: package.json is not valid JSON", pj, key=f"badjson|{pj}")
             continue
         has_deps = bool(data.get("dependencies") or data.get("devDependencies"))
-        lock = next((d + n for n in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock")
-                     if d + n in names or (repo.root / (d + n)).is_file()), None)
+        lock = next((d + n for n in NODE_LOCKS if d + n in names or (repo.root / (d + n)).is_file()), None)
+        if has_deps and not lock:
+            # A workspace member has no lockfile of its own by design: the root's covers it.
+            lock = _workspace_lock(pj, repo, names)
         if has_deps and not lock:
             r.add(BLOCK, "DEP-1: Node dependencies with no lockfile; installs are not reproducible and cannot be audited",
                   pj, key=f"nolock|{pj}")
-        elif lock:
+        elif lock and lock not in node_locks:
             node_locks.append(lock)
     for req in reqs:
         for n, line in enumerate((repo.text(req) or "").splitlines(), 1):

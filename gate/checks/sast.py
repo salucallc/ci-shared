@@ -39,6 +39,16 @@ BANDIT_VERSION = "1.9.4"
 BANDIT_SEVERITY = "medium"
 BANDIT_CONFIDENCE = "medium"
 SEMGREP_VERSION = "1.160.0"
+# 0 = no per-target limit. Semgrep's default is 5 seconds per rule/target pair, and a target that
+# exceeds it is DROPPED WITH NO ERROR AT ALL: `errors` is empty, `skipped_rules` is empty, and the
+# only evidence is a finding that is not there. Measured 2026-11-01 on saluca-content: a scan of
+# `tools/` (279 files, default timeout) missed `tools/push_in.py:313,327`, which the same image
+# found when the file was scanned alone or with `--timeout 120`. That makes the result depend on
+# how many files were in the walk and how loaded the machine was, so two machines disagree about
+# what the repo contains and a baseline written on one is wrong for the other - which is exactly
+# how PR 163 went red on a tree that was green locally. A slow repository should be slow, not
+# quietly smaller; the 3600 s subprocess cap below is the backstop.
+SEMGREP_TIMEOUT_SECONDS = "0"
 SEMGREP_CONFIGS = ("p/owasp-top-ten", "p/python", "p/secrets", "p/ci")
 SEMGREP_SEVERITY = "ERROR"
 SEMGREP_IMAGE = f"semgrep/semgrep:{SEMGREP_VERSION}"
@@ -176,6 +186,15 @@ def run_bandit(repo: Repo, opts) -> Result:
     return r
 
 
+def semgrep_argv(cmd: list[str]) -> list[str]:
+    """The full argument list, so the flags are one testable thing rather than a literal in a call."""
+    args = []
+    for c in SEMGREP_CONFIGS:
+        args += ["--config", c]
+    return cmd + args + [f"--severity={SEMGREP_SEVERITY}", "--error", "--json", "--quiet",
+                         "--disable-version-check", "--timeout", SEMGREP_TIMEOUT_SECONDS, "."]
+
+
 def run_semgrep(repo: Repo, opts) -> Result:
     r = Result("semgrep", f"Generic SAST: semgrep {SEMGREP_VERSION} ({', '.join(SEMGREP_CONFIGS)}; {SEMGREP_SEVERITY})")
     tracked = set(repo.tracked())
@@ -186,12 +205,9 @@ def run_semgrep(repo: Repo, opts) -> Result:
     cmd, why = semgrep_command(repo.root)
     if not cmd:
         return r.cannot(why)
-    args = []
-    for c in SEMGREP_CONFIGS:
-        args += ["--config", c]
     try:
-        out = subprocess.run(cmd + args + [f"--severity={SEMGREP_SEVERITY}", "--error", "--json", "--quiet",
-                                           "--disable-version-check", "."], cwd=repo.root, capture_output=True,
+        out = subprocess.run(semgrep_argv(cmd),
+                             cwd=repo.root, capture_output=True,
                              text=True, encoding="utf-8", errors="replace", timeout=3600)
     except (OSError, subprocess.TimeoutExpired) as e:
         return r.cannot(f"semgrep did not run: {type(e).__name__}: {e}")
