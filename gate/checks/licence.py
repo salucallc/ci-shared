@@ -84,6 +84,13 @@ def mentioned(text: str) -> set[str]:
     if re.search(r"(?i)functional source license|\bFSL-1\.1", text):
         ids.add("FSL-1.1-MIT" if re.search(r"(?i)MIT Future License|FSL-1\.1-MIT", text) else "FSL-1.1-ALv2")
         ids -= {"Apache-2.0", "MIT"}
+    # SPDX's own spelling for a licence the list does not carry, which is what identify() calls a
+    # text that reserves all rights. Without this arm a proprietary repo can NEVER satisfy LIC-2:
+    # the README states the licence correctly and the check still says it names none. Only when the
+    # section names no other licence, so "MIT. Copyright ... All rights reserved." stays MIT.
+    if not ids and re.search(r"(?i)\b(all rights reserved|proprietary)\b", text) \
+            and not re.search(r"(?i)permission is hereby granted", text):
+        ids.add("LicenseRef-Proprietary")
     return ids
 CLASSIFIER = re.compile(r"License :: (?:OSI Approved :: )?([^\"'\n]+)")
 

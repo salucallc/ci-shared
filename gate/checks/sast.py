@@ -39,6 +39,20 @@ BANDIT_VERSION = "1.9.4"
 BANDIT_SEVERITY = "medium"
 BANDIT_CONFIDENCE = "medium"
 SEMGREP_VERSION = "1.160.0"
+# 0 = no per-target limit. Semgrep's default is 5 seconds per rule/target pair, and a target that
+# exceeds it is DROPPED. What is left behind is unreliable: measured 2026-11-01 on saluca-content,
+# one scan of `tools/` reported the timeouts as `Type: Timeout` entries in `errors`, while a wider
+# scan missed `tools/push_in.py:313,327` entirely - no `errors` entry, no `skipped_rules`, no
+# `paths.skipped`, and no evidence at all except the finding that was not there, though
+# `paths.scanned` listed the file. The same image found both findings on the file alone and with
+# `--timeout 120`. Two consecutive runs of the same command on the same tree then returned 28
+# findings and 21 errors, then 29 findings and 23 errors. So the result depends on how many files
+# are in the walk and how loaded the machine is, two machines disagree about what the repo
+# contains, and a baseline written on one is wrong for the other - which is exactly how PR 163
+# went red on a tree that was green locally. A slow repository should be slow, not quietly
+# smaller; the 3600 s subprocess cap below is the backstop, and a remaining semgrep error is
+# cannot tell rather than a note.
+SEMGREP_TIMEOUT_SECONDS = "0"
 SEMGREP_CONFIGS = ("p/owasp-top-ten", "p/python", "p/secrets", "p/ci")
 SEMGREP_SEVERITY = "ERROR"
 SEMGREP_IMAGE = f"semgrep/semgrep:{SEMGREP_VERSION}"
@@ -176,6 +190,15 @@ def run_bandit(repo: Repo, opts) -> Result:
     return r
 
 
+def semgrep_argv(cmd: list[str]) -> list[str]:
+    """The full argument list, so the flags are one testable thing rather than a literal in a call."""
+    args = []
+    for c in SEMGREP_CONFIGS:
+        args += ["--config", c]
+    return cmd + args + [f"--severity={SEMGREP_SEVERITY}", "--error", "--json", "--quiet",
+                         "--disable-version-check", "--timeout", SEMGREP_TIMEOUT_SECONDS, "."]
+
+
 def run_semgrep(repo: Repo, opts) -> Result:
     r = Result("semgrep", f"Generic SAST: semgrep {SEMGREP_VERSION} ({', '.join(SEMGREP_CONFIGS)}; {SEMGREP_SEVERITY})")
     tracked = set(repo.tracked())
@@ -186,12 +209,9 @@ def run_semgrep(repo: Repo, opts) -> Result:
     cmd, why = semgrep_command(repo.root)
     if not cmd:
         return r.cannot(why)
-    args = []
-    for c in SEMGREP_CONFIGS:
-        args += ["--config", c]
     try:
-        out = subprocess.run(cmd + args + [f"--severity={SEMGREP_SEVERITY}", "--error", "--json", "--quiet",
-                                           "--disable-version-check", "."], cwd=repo.root, capture_output=True,
+        out = subprocess.run(semgrep_argv(cmd),
+                             cwd=repo.root, capture_output=True,
                              text=True, encoding="utf-8", errors="replace", timeout=3600)
     except (OSError, subprocess.TimeoutExpired) as e:
         return r.cannot(f"semgrep did not run: {type(e).__name__}: {e}")
@@ -216,9 +236,23 @@ def run_semgrep(repo: Repo, opts) -> Result:
         msg = " ".join(str((f.get("extra") or {}).get("message", "")).split())
         h = snippet_hash(repo, rel, start, end)
         r.add(BLOCK, f"SEC-10: semgrep {rule}: {msg[:300]}", rel, start, key=f"semgrep|{rule}|{rel}|{h}")
-    errs = [e for e in data.get("errors", []) if isinstance(e, dict)]
     r.notes.append(f"semgrep {SEMGREP_VERSION} via {'docker ' + SEMGREP_IMAGE if 'docker' in Path(cmd[0]).name else cmd[0]}; "
                    "`# nosemgrep: <rule-id>` with a reason suppresses one line"
-                   + (f"; {outside} result(s) in untracked or excluded files ignored" if outside else "")
-                   + (f"; {len(errs)} non-fatal semgrep error(s) (parse or timeout)" if errs else ""))
+                   + (f"; {outside} result(s) in untracked or excluded files ignored" if outside else ""))
+    errs = [e for e in data.get("errors", []) if isinstance(e, dict)]
+    if errs:
+        # A semgrep error means part of the tree was NOT analysed, so the absence of a finding
+        # there proves nothing. This used to be a note and the check still passed, which is how
+        # two consecutive runs of the same command on the same tree disagreed: saluca-content,
+        # 2026-11-01, 28 findings with 21 errors, then 29 findings with 23 ("non-fatal") errors.
+        # Cannot tell is never a pass.
+        kinds = {}
+        for e in errs:
+            kinds[str(e.get("type") or "error")] = kinds.get(str(e.get("type") or "error"), 0) + 1
+        detail = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+        first = next((e for e in errs if e.get("message")), errs[0])
+        where = _norm(str(first.get("path") or "")) or "the tree"
+        return r.cannot(f"semgrep reported {len(errs)} error(s) ({detail}), so part of the tree was not "
+                        f"analysed and a missing finding there means nothing; first: {where}: "
+                        f"{' '.join(str(first.get('message') or '').split())[:300]}")
     return r

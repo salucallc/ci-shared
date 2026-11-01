@@ -78,4 +78,4 @@ jobs:
               config_flags+=(--config "$cfg")
             fi
           done <<< "$SEMGREP_CONFIGS"
-          semgrep "${config_flags[@]}" --severity="$SEMGREP_SEVERITY" --error .
+          semgrep "${config_flags[@]}" --severity="$SEMGREP_SEVERITY" --error --timeout 0 .

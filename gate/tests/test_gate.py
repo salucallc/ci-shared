@@ -1095,6 +1095,44 @@ class Deps(Base):
         pj = json.dumps({"name": "demo", "license": "MIT", "dependencies": {"left-pad": "^1.3.0"}})
         self.assertFails(dict(CLEAN_PY, **{"package.json": pj}), "deps", "no lockfile")
 
+    def test_workspace_member_is_covered_by_the_root_lockfile(self):
+        """A workspace has ONE lockfile at its root; demanding a second one inside each member
+        reports correctly pinned repos as unpinned. Found on saluca-content, 2026-11-01."""
+        root = json.dumps({"name": "demo", "private": True, "workspaces": ["shared/*", "pipeline"]})
+        self.assertPasses(dict(CLEAN_PY, **{
+            "package.json": root,
+            "bun.lock": '{}\n',
+            "shared/compose/package.json": json.dumps({"name": "compose", "devDependencies": {"typescript": "^5.6.0"}}),
+            "pipeline/package.json": json.dumps({"name": "pipeline", "dependencies": {"yaml": "^2.5.0"}}),
+        }), "deps", allow=("pass", "warn"))
+
+    def test_workspace_member_without_a_root_lockfile_still_fails(self):
+        root = json.dumps({"name": "demo", "private": True, "workspaces": ["shared/*"]})
+        self.assertFails(dict(CLEAN_PY, **{
+            "package.json": root,
+            "shared/compose/package.json": json.dumps({"name": "compose", "dependencies": {"yaml": "^2.5.0"}}),
+        }), "deps", "no lockfile")
+
+    def test_a_package_json_above_a_member_does_not_cover_it(self):
+        """The root must DECLARE the member. A package.json merely sitting above it, with a
+        lockfile of its own, proves nothing about the member's dependencies."""
+        root = json.dumps({"name": "demo", "devDependencies": {"prettier": "^3.0.0"}})
+        self.assertFails(dict(CLEAN_PY, **{
+            "package.json": root,
+            "bun.lock": '{}\n',
+            "shared/compose/package.json": json.dumps({"name": "compose", "dependencies": {"yaml": "^2.5.0"}}),
+        }), "deps", "no lockfile")
+
+    def test_a_workspace_glob_does_not_reach_a_nested_directory(self):
+        """`packages/*` is one level, as npm reads it. Matching it with plain fnmatch would let it
+        swallow `packages/a/b` and pass a member nothing covers."""
+        root = json.dumps({"name": "demo", "private": True, "workspaces": ["packages/*"]})
+        self.assertFails(dict(CLEAN_PY, **{
+            "package.json": root,
+            "bun.lock": '{}\n',
+            "packages/a/b/package.json": json.dumps({"name": "b", "dependencies": {"yaml": "^2.5.0"}}),
+        }), "deps", "no lockfile")
+
     def test_unpinned_requirement_is_warning(self):
         self.assertPasses(dict(CLEAN_PY, **{"requirements.txt": "requests\n"}), "deps", allow=("warn",))
 
@@ -1137,6 +1175,27 @@ class Security(Base):
     def test_printing_a_generated_key_fails(self):
         code = "from keys import generate_api_key\n\n\ndef main():\n    print('key:', generate_api_key())\n"
         self.assertFails(dict(CLEAN_PY, **{"src/demo.py": code}), "security", "SEC-6")
+
+    def test_printed_key_path_is_not_a_printed_key(self):
+        # saluca-content edit/core/attest.py:183,197, 2026-11-01. A Path holding where the key lives
+        # is the opposite of the key; the two findings landed on the file that gets this most right.
+        code = ("from pathlib import Path\nKEY_DIR = Path.home() / '.keys'\n"
+                "PRIVATE_KEY = KEY_DIR / 'signing_key.pem'\n\n\ndef create(force=False):\n"
+                "    if PRIVATE_KEY.exists() and not force:\n"
+                "        print(f'  REFUSED: a key already exists at {PRIVATE_KEY}')\n"
+                "    print(f'  private key -> {PRIVATE_KEY}   (never commit this, never print it)')\n")
+        self.assertPasses(dict(CLEAN_PY, **{"src/attest.py": code}), "security", allow=("pass",))
+
+    def test_a_name_bound_to_a_path_in_one_place_and_a_key_in_another_still_fails(self):
+        """The exemption is only sound when EVERY assignment is a path. One that is not keeps the finding."""
+        code = ("from pathlib import Path\nPRIVATE_KEY = Path('k.pem')\n\n\ndef rotate():\n"
+                "    global PRIVATE_KEY\n    PRIVATE_KEY = read_private_key()\n    print(PRIVATE_KEY)\n")
+        self.assertFails(dict(CLEAN_PY, **{"src/attest.py": code}), "security", "SEC-6")
+
+    def test_a_key_read_from_a_file_is_still_a_key(self):
+        code = ("from pathlib import Path\nKEY_DIR = Path.home() / '.keys'\n\n\ndef show():\n"
+                "    private_key = (KEY_DIR / 'k.pem').read_text()\n    print(private_key)\n")
+        self.assertFails(dict(CLEAN_PY, **{"src/attest.py": code}), "security", "SEC-6")
 
     def test_secret_printed_in_examples_is_warning(self):
         code = "def main(secret):\n    print('recovered', secret)\n"
@@ -1461,6 +1520,60 @@ class Semgrep(Base):
         self.assertEqual(code, 2, out)
         self.assertEqual(status_of(data, "semgrep"), "cannot-tell", out)
 
+    def test_no_per_target_timeout_is_disabled(self):
+        """The default 5 s timeout drops a target, so the same tree scans differently on a busy
+        machine (saluca-content, 2026-11-01: `tools/push_in.py` disappeared from a 279-file walk
+        and came back with --timeout 120; two consecutive runs of the same command then returned
+        28 findings and 21 errors, then 29 findings and 23 errors)."""
+        from gate.checks.sast import semgrep_argv
+
+        argv = semgrep_argv(["semgrep"])
+        self.assertIn("--timeout", argv)
+        self.assertEqual(argv[argv.index("--timeout") + 1], "0", argv)
+
+    def test_a_semgrep_error_is_cannot_tell_not_a_pass(self):
+        """A semgrep error means part of the tree was NOT analysed, so the absence of a finding
+        there proves nothing. This was a note on a passing check; that is how the same command on
+        the same tree passed once and failed once, minutes apart, on saluca-content."""
+        import types
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+        from gate.core import Repo as CoreRepo
+
+        repo = GateRepo(dict(CLEAN_PY))
+        self.addCleanup(repo.close)
+        payload = {"results": [], "errors": [
+            {"type": "Timeout", "level": "warn", "path": "src/run.py",
+             "message": "Timeout when running python.lang.security on src/run.py"}]}
+        done = mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+        opts = types.SimpleNamespace(offline=False)
+        with mock.patch.object(sast_mod, "semgrep_command", return_value=(["semgrep"], "")), \
+                mock.patch.object(sast_mod.subprocess, "run", return_value=done):
+            res = sast_mod.run_semgrep(CoreRepo(repo.path, files=["src/run.py"]), opts)
+        self.assertEqual(res.status, "cannot-tell", res.notes)
+        self.assertIn("not analysed", " ".join(res.notes))
+
+    def test_a_clean_semgrep_run_with_results_still_blocks(self):
+        """CONFIRM THE TEST ABOVE CAN FAIL: the same seam, with no errors, is an ordinary run."""
+        import types
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+        from gate.core import Repo as CoreRepo
+
+        repo = GateRepo(dict(CLEAN_PY, **{"src/run.py": "import os\nos.system(x)\n"}))
+        self.addCleanup(repo.close)
+        payload = {"results": [{"path": "src/run.py", "check_id": "p/python.x",
+                                "start": {"line": 2}, "end": {"line": 2},
+                                "extra": {"message": "found it"}}], "errors": []}
+        done = mock.Mock(returncode=1, stdout=json.dumps(payload), stderr="")
+        opts = types.SimpleNamespace(offline=False)
+        with mock.patch.object(sast_mod, "semgrep_command", return_value=(["semgrep"], "")), \
+                mock.patch.object(sast_mod.subprocess, "run", return_value=done):
+            res = sast_mod.run_semgrep(CoreRepo(repo.path, files=["src/run.py"]), opts)
+        self.assertEqual(res.status, "fail", res.notes)
+        self.assertEqual(len(res.findings), 1)
 
 class BaselineAdoption(Base):
     def test_baseline_is_refused_while_sast_cannot_run(self):

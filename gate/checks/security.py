@@ -65,12 +65,73 @@ PASSTHROUGH = {"str", "repr", "format", "bytes", "decode", "encode", "hex", "str
                "urlsafe_b64encode", "join", "replace", "get", "getattr", "f"}
 
 
-def _leak(node: ast.AST) -> str:
+PATH_FACTORY = {"Path", "PurePath", "PosixPath", "WindowsPath", "PurePosixPath", "PureWindowsPath"}
+PATH_FUNCS = {"join", "dirname", "abspath", "realpath", "expanduser", "normpath", "joinpath", "resolve", "absolute",
+              "with_name", "with_suffix", "cwd", "home", "fspath"}
+PATH_ATTRS = {"parent", "parents"}
+
+
+def _is_path_expr(node: ast.AST, known: set[str]) -> bool:
+    """True when this expression provably holds a filesystem path rather than key material.
+
+    Whole-module and static: `PRIVATE_KEY = KEY_DIR / "signing_key.pem"` is a path; `PRIVATE_KEY =
+    load_pem(...)` is not. Printing a path is how a tool tells you where it wrote the key, which is
+    the opposite of leaking one, and a name-based rule alone cannot tell the two apart.
+    """
+    if isinstance(node, ast.Name):
+        return node.id in known
+    if isinstance(node, ast.Attribute):
+        return node.attr in PATH_ATTRS and _is_path_expr(node.value, known)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return _is_path_expr(node.left, known) or _is_path_expr(node.right, known)
+    if isinstance(node, ast.JoinedStr):
+        return all(not isinstance(v, ast.FormattedValue) or _is_path_expr(v.value, known) for v in node.values)
+    if isinstance(node, ast.Call):
+        func = node.func
+        base = func.value if isinstance(func, ast.Attribute) else None
+        if isinstance(func, ast.Name):
+            if func.id in PATH_FACTORY:
+                return True
+            return bool(node.args) and func.id in ("str", "repr") and _is_path_expr(node.args[0], known)
+        if isinstance(func, ast.Attribute) and func.attr in PATH_FUNCS:
+            if base is not None and (_is_path_expr(base, known) or _dotted(base) in PATH_FACTORY):
+                return True
+            return _dotted(base) == "os.path"
+        return False
+    return False
+
+
+def path_names(tree: ast.AST) -> set[str]:
+    """Module names every one of whose assignments is a path expression.
+
+    Fixed point, because one path name defines the next (`KEY_DIR`, then `PRIVATE_KEY = KEY_DIR / x`).
+    A name assigned a path in one place and something else anywhere is NOT a path name: the safe
+    direction is to keep flagging it.
+    """
+    binds: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            binds.setdefault(node.targets[0].id, []).append(node.value)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            binds.setdefault(node.target.id, []).append(node.value)
+    known: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, exprs in binds.items():
+            if name not in known and all(_is_path_expr(e, known) for e in exprs):
+                known.add(name)
+                changed = True
+    return known
+
+
+def _leak(node: ast.AST, paths: frozenset[str] | set[str] = frozenset()) -> str:
     """The secret-like name whose VALUE this expression prints, or ''.
 
     A call's arguments are not printed, only its return value: print(verify_token(secret, tok))
     prints a verdict. A call returns a secret when its name says so (generate_api_key()), or when
     it only reformats its input (str(), repr(), .decode(), json.dumps()); then its inputs count.
+    A name that holds a path is not a secret, whatever it is called.
     """
     if isinstance(node, ast.Call):
         fname = _name_of(node.func)
@@ -79,25 +140,25 @@ def _leak(node: ast.AST) -> str:
         if fname in PASSTHROUGH:
             for child in list(node.args) + [k.value for k in node.keywords] + (
                     [node.func.value] if isinstance(node.func, ast.Attribute) else []):
-                got = _leak(child)
+                got = _leak(child, paths)
                 if got:
                     return got
         return ""
     if isinstance(node, (ast.Name, ast.Attribute)):
         nm = _name_of(node)
-        if nm and SECRET_NAME.search(nm) and not benign(nm):
+        if nm and SECRET_NAME.search(nm) and not benign(nm) and nm not in paths:
             return nm
-        return _leak(node.value) if isinstance(node, ast.Attribute) else ""
+        return _leak(node.value, paths) if isinstance(node, ast.Attribute) else ""
     for child in ast.iter_child_nodes(node):
-        got = _leak(child)
+        got = _leak(child, paths)
         if got:
             return got
     return ""
 
 
 class PyScan(ast.NodeVisitor):
-    def __init__(self, rel: str, text: str):
-        self.rel, self.text, self.hits = rel, text, []
+    def __init__(self, rel: str, text: str, paths: frozenset[str] | set[str] = frozenset()):
+        self.rel, self.text, self.hits, self.paths = rel, text, [], paths
 
     def hit(self, sev, node, msg):
         self.hits.append((sev, getattr(node, "lineno", 0), msg))
@@ -130,7 +191,7 @@ class PyScan(ast.NodeVisitor):
             for arg in list(node.args) + [k.value for k in node.keywords]:
                 if REDACT_CALL.search(_dotted(arg)):
                     continue
-                leaked = _leak(arg)
+                leaked = _leak(arg, self.paths)
                 if leaked:
                     break
             if leaked:
@@ -143,7 +204,7 @@ def py_scan(rel: str, text: str):
         tree = ast.parse(text)
     except SyntaxError:
         return []
-    s = PyScan(rel, text)
+    s = PyScan(rel, text, path_names(tree))
     s.visit(tree)
     return s.hits
 
