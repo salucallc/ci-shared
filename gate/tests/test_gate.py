@@ -1521,15 +1521,59 @@ class Semgrep(Base):
         self.assertEqual(status_of(data, "semgrep"), "cannot-tell", out)
 
     def test_no_per_target_timeout_is_disabled(self):
-        """The default 5 s timeout drops a target with NO error, NO skipped_rules entry and NO trace
-        beyond the finding that is not there, so the same tree scans differently on a busy machine
-        (saluca-content, 2026-11-01: `tools/push_in.py` disappeared from a 279-file walk and came
-        back with --timeout 120)."""
+        """The default 5 s timeout drops a target, so the same tree scans differently on a busy
+        machine (saluca-content, 2026-11-01: `tools/push_in.py` disappeared from a 279-file walk
+        and came back with --timeout 120; two consecutive runs of the same command then returned
+        28 findings and 21 errors, then 29 findings and 23 errors)."""
         from gate.checks.sast import semgrep_argv
 
         argv = semgrep_argv(["semgrep"])
         self.assertIn("--timeout", argv)
         self.assertEqual(argv[argv.index("--timeout") + 1], "0", argv)
+
+    def test_a_semgrep_error_is_cannot_tell_not_a_pass(self):
+        """A semgrep error means part of the tree was NOT analysed, so the absence of a finding
+        there proves nothing. This was a note on a passing check; that is how the same command on
+        the same tree passed once and failed once, minutes apart, on saluca-content."""
+        import types
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+        from gate.core import Repo as CoreRepo
+
+        repo = GateRepo(dict(CLEAN_PY))
+        self.addCleanup(repo.close)
+        payload = {"results": [], "errors": [
+            {"type": "Timeout", "level": "warn", "path": "src/run.py",
+             "message": "Timeout when running python.lang.security on src/run.py"}]}
+        done = mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+        opts = types.SimpleNamespace(offline=False)
+        with mock.patch.object(sast_mod, "semgrep_command", return_value=(["semgrep"], "")), \
+                mock.patch.object(sast_mod.subprocess, "run", return_value=done):
+            res = sast_mod.run_semgrep(CoreRepo(repo.path, files=["src/run.py"]), opts)
+        self.assertEqual(res.status, "cannot-tell", res.notes)
+        self.assertIn("not analysed", " ".join(res.notes))
+
+    def test_a_clean_semgrep_run_with_results_still_blocks(self):
+        """CONFIRM THE TEST ABOVE CAN FAIL: the same seam, with no errors, is an ordinary run."""
+        import types
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+        from gate.core import Repo as CoreRepo
+
+        repo = GateRepo(dict(CLEAN_PY, **{"src/run.py": "import os\nos.system(x)\n"}))
+        self.addCleanup(repo.close)
+        payload = {"results": [{"path": "src/run.py", "check_id": "p/python.x",
+                                "start": {"line": 2}, "end": {"line": 2},
+                                "extra": {"message": "found it"}}], "errors": []}
+        done = mock.Mock(returncode=1, stdout=json.dumps(payload), stderr="")
+        opts = types.SimpleNamespace(offline=False)
+        with mock.patch.object(sast_mod, "semgrep_command", return_value=(["semgrep"], "")), \
+                mock.patch.object(sast_mod.subprocess, "run", return_value=done):
+            res = sast_mod.run_semgrep(CoreRepo(repo.path, files=["src/run.py"]), opts)
+        self.assertEqual(res.status, "fail", res.notes)
+        self.assertEqual(len(res.findings), 1)
 
 class BaselineAdoption(Base):
     def test_baseline_is_refused_while_sast_cannot_run(self):
