@@ -1136,6 +1136,21 @@ class Deps(Base):
     def test_unpinned_requirement_is_warning(self):
         self.assertPasses(dict(CLEAN_PY, **{"requirements.txt": "requests\n"}), "deps", allow=("warn",))
 
+    def test_a_prefixed_requirements_file_is_read(self):
+        """`.github/ci-requirements.txt` must be checked like `requirements.txt`. The old pattern
+        needed a basename starting with "requirements", so this file read n/a while it pinned a
+        whole CI toolchain with 41 open advisories (life-os, 2026-11-04)."""
+        code, out, data = self.run_gate(dict(CLEAN_PY, **{".github/ci-requirements.txt": "pillow\n"}),
+                                        "--only", "deps", "--offline", "--no-audit")
+        self.assertEqual(status_of(data, "deps"), "warn", out)
+        self.assertIn("ci-requirements.txt", json.dumps(data), out)
+
+    def test_requirements_pattern_is_not_a_substring_free_for_all(self):
+        """Only .txt files whose basename names requirements; a markdown note about them is not one."""
+        code, out, data = self.run_gate(dict(CLEAN_PY, **{"docs/requirements-notes.md": "pillow\n"}),
+                                        "--only", "deps", "--offline", "--no-audit")
+        self.assertEqual(status_of(data, "deps"), "n/a", out)
+
     def test_audit_without_auditor_is_cannot_tell(self):
         home = tempfile.mkdtemp(prefix="repogate-home-")
         env = {"HOME": home, "USERPROFILE": home,
