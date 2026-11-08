@@ -240,6 +240,36 @@ def run_semgrep(repo: Repo, opts) -> Result:
                    "`# nosemgrep: <rule-id>` with a reason suppresses one line"
                    + (f"; {outside} result(s) in untracked or excluded files ignored" if outside else ""))
     errs = [e for e in data.get("errors", []) if isinstance(e, dict)]
+    # PartialParsing is the one error that names exactly what was not analysed: semgrep parsed the
+    # file, and one rule could not parse a sub-snippet of it (in practice `${{ ... }}` inside a
+    # workflow `run:` block, read as Bash by gha-curl-pipe-shell's metavariable-pattern). Each
+    # named span becomes a BLOCKING finding keyed by the hash of its lines: it is never a pass, a
+    # baseline records it like any other finding and lists it in the PR, and an edit to the span
+    # is a new finding. Found 2026-11-08: tiresias-report and tiresias-watch read cannot-tell on
+    # every run, so `gate baseline` refused and neither repo could adopt. Every other error kind
+    # (timeouts above all, which name no span) stays cannot tell.
+    unparsed: set[str] = set()
+    rest = []
+    for e in errs:
+        kind = e.get("type")
+        spans = kind[1] if isinstance(kind, list) and len(kind) > 1 and kind[0] == "PartialParsing" else None
+        if not (isinstance(spans, list) and spans and all(isinstance(s, dict) and s.get("path") for s in spans)):
+            rest.append(e)
+            continue
+        m = re.search(r"in rule '([^']+)'", str(e.get("message") or ""))
+        rule = str(e.get("rule_id") or (m.group(1) if m else "") or "a rule")
+        for s in spans:
+            rel = _norm(str(s.get("path")))
+            start = int((s.get("start") or {}).get("line") or 0)
+            end = int((s.get("end") or {}).get("line") or start)
+            key = f"semgrep-unparsed|{rule}|{rel}|{snippet_hash(repo, rel, start, end)}"
+            if rel not in tracked or key in unparsed:
+                continue
+            unparsed.add(key)
+            r.add(BLOCK, f"SEC-10: semgrep could not parse lines {start}-{end} for {rule}, so that rule did "
+                  "not analyse them; rewrite the span (in a workflow, pass `${{ }}` values through `env:`) "
+                  "or record it in the baseline", rel, start, key=key)
+    errs = rest
     if errs:
         # A semgrep error means part of the tree was NOT analysed, so the absence of a finding
         # there proves nothing. This used to be a note and the check still passed, which is how

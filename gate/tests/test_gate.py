@@ -1569,6 +1569,54 @@ class Semgrep(Base):
         self.assertEqual(res.status, "cannot-tell", res.notes)
         self.assertIn("not analysed", " ".join(res.notes))
 
+    def _semgrep_with(self, files, payload):
+        import types
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+        from gate.core import Repo as CoreRepo
+
+        repo = GateRepo(dict(CLEAN_PY, **files))
+        self.addCleanup(repo.close)
+        done = mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+        with mock.patch.object(sast_mod, "semgrep_command", return_value=(["semgrep"], "")), \
+                mock.patch.object(sast_mod.subprocess, "run", return_value=done):
+            return sast_mod.run_semgrep(CoreRepo(repo.path, files=["src/run.py", *files]),
+                                        types.SimpleNamespace(offline=False))
+
+    WF_FILE = {".github/workflows/rel.yml": "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - run: |\n          V=\"${{ inputs.tag }}\"\n          echo \"$V\"\n"}
+    PARTIAL = {"type": ["PartialParsing", [{"path": ".github/workflows/rel.yml",
+                                           "start": {"line": 7, "col": 1}, "end": {"line": 7, "col": 20}}]],
+               "level": "warn", "path": ".github/workflows/rel.yml",
+               "message": "Syntax error at line .github/workflows/rel.yml:7: When parsing a snippet as Bash for "
+                          "metavariable-pattern in rule 'yaml.github-actions.security.gha-curl-pipe-shell."
+                          "gha-curl-pipe-shell', `{ inputs.tag` was unexpected"}
+
+    def test_a_partial_parse_is_a_blocking_finding_on_its_span(self):
+        """2026-11-08: tiresias-report and tiresias-watch were cannot-tell on every run because one
+        rule could not read `${{ }}` in a run block as Bash, so `gate baseline` refused. The span is
+        named, so it is reported as a BLOCKING finding on those lines: never a pass, and baselineable."""
+        res = self._semgrep_with(self.WF_FILE, {"results": [], "errors": [self.PARTIAL]})
+        self.assertEqual(res.status, "fail", res.notes)
+        self.assertEqual(len(res.findings), 1, res.findings)
+        f = res.findings[0]
+        self.assertEqual((f.path, f.line, f.severity), (".github/workflows/rel.yml", 7, "block"))
+        self.assertIn("gha-curl-pipe-shell", f.message)
+
+    def test_a_partial_parse_next_to_a_timeout_is_still_cannot_tell(self):
+        """CONFIRM THE TEST ABOVE CAN FAIL in the direction that matters: a timeout names no span,
+        so its presence keeps the whole check at cannot tell even when a partial parse is handled."""
+        timeout = {"type": "Timeout", "level": "warn", "path": "src/run.py",
+                   "message": "Timeout when running python.lang.security on src/run.py"}
+        res = self._semgrep_with(self.WF_FILE, {"results": [], "errors": [self.PARTIAL, timeout]})
+        self.assertEqual(res.status, "cannot-tell", res.notes)
+
+    def test_a_partial_parse_without_spans_is_cannot_tell(self):
+        bare = dict(self.PARTIAL, type="PartialParsing")
+        res = self._semgrep_with(self.WF_FILE, {"results": [], "errors": [bare]})
+        self.assertEqual(res.status, "cannot-tell", res.notes)
+
     def test_a_clean_semgrep_run_with_results_still_blocks(self):
         """CONFIRM THE TEST ABOVE CAN FAIL: the same seam, with no errors, is an ordinary run."""
         import types
