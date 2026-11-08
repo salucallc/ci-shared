@@ -162,10 +162,22 @@ def run(repo: Repo, opts) -> Result:
         if not cmd:
             return r.cannot("pip-audit not found; run `python -m gate bootstrap` (installs it into a venv under the gate cache)")
         for req in reqs:
-            out = subprocess.run(cmd + ["-r", str(repo.root / req), "--format", "json", "--progress-spinner", "off"],
+            # A hash-pinned file names the exact wheels, often for another platform (an image's
+            # linux/amd64 wheels). Letting pip resolve it on Windows fails on the hashes, so the
+            # file is audited as written (--disable-pip), which is also what it means.
+            hashed = "--hash" in (repo.text(req) or "")
+            out = subprocess.run(cmd + ["-r", str(repo.root / req), "--format", "json", "--progress-spinner", "off"]
+                                 + (["--disable-pip"] if hashed else []),
                                  capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+            if not out.stdout.strip():
+                # pip-audit exits 1 both for "vulnerabilities found" and for "could not install or
+                # resolve"; only the first prints a report. Reading an empty report as "no
+                # dependencies" passed tiresias-report's image requirements on every Windows run
+                # while CI found PYSEC-2026-3552 in them (2026-11-08). Cannot tell, never a pass.
+                r.cannot(f"pip-audit on {req} exited {out.returncode} with no report: {out.stderr.strip()[-300:]}")
+                continue
             try:
-                data = json.loads(out.stdout or "{}")
+                data = json.loads(out.stdout)
             except json.JSONDecodeError:
                 r.cannot(f"pip-audit on {req} exited {out.returncode}: {out.stderr.strip()[-300:]}")
                 continue

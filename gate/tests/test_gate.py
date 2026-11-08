@@ -1159,6 +1159,42 @@ class Deps(Base):
                                         "--offline", env=env)
         self.assertEqual(code, 2, out)
 
+    def _deps_with(self, files, stdout, returncode=1):
+        import types
+        from unittest import mock
+
+        from gate.checks import deps as deps_mod
+        from gate.core import Repo as CoreRepo
+
+        repo = GateRepo(dict(CLEAN_PY, **files))
+        self.addCleanup(repo.close)
+        done = mock.Mock(returncode=returncode, stdout=stdout, stderr="ERROR: THESE PACKAGES DO NOT MATCH THE HASHES")
+        with mock.patch.object(deps_mod, "pip_audit_cmd", return_value=["pip-audit"]), \
+                mock.patch.object(deps_mod.subprocess, "run", return_value=done) as run:
+            res = deps_mod.run(CoreRepo(repo.path, files=list(files)), types.SimpleNamespace(audit=True))
+        return res, run
+
+    def test_pip_audit_failing_with_no_report_is_cannot_tell(self):
+        """2026-11-08: pip-audit could not install a hash-pinned linux wheel list on Windows, exited
+        1 with an empty stdout, and the check read that as "no dependencies": green locally while
+        CI found PYSEC-2026-3552 in the same file."""
+        res, _ = self._deps_with({"requirements.txt": "cryptography==49.0.0\n"}, stdout="")
+        self.assertEqual(res.status, "cannot-tell", res.notes)
+
+    def test_pip_audit_with_a_report_still_reports_findings(self):
+        """CONFIRM THE TEST ABOVE CAN FAIL: the same seam with a report is an ordinary finding."""
+        report = json.dumps({"dependencies": [{"name": "cryptography", "version": "49.0.0", "vulns": [
+            {"id": "PYSEC-2026-3552", "fix_versions": ["50.0.0"]}]}]})
+        res, _ = self._deps_with({"requirements.txt": "cryptography==49.0.0\n"}, stdout=report)
+        self.assertEqual(res.status, "fail", res.notes)
+
+    def test_a_hashed_requirements_file_is_audited_as_written(self):
+        hashed = "cryptography==49.0.0 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+        _, run = self._deps_with({"issuer/requirements-image.txt": hashed}, stdout='{"dependencies": []}', returncode=0)
+        self.assertIn("--disable-pip", run.call_args[0][0])
+        _, run = self._deps_with({"requirements.txt": "cryptography==49.0.0\n"}, stdout='{"dependencies": []}', returncode=0)
+        self.assertNotIn("--disable-pip", run.call_args[0][0])
+
 
 class Security(Base):
     def test_proxy_forwards_incoming_headers_fails(self):
