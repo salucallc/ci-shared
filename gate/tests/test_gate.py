@@ -1703,5 +1703,50 @@ class SastCiParity(unittest.TestCase):
         self.assertEqual(tuple(cfg), sast.SEMGREP_CONFIGS)
 
 
+class RenderEncoding(Base):
+    """The report must print even when a finding quotes a character stdout cannot encode.
+
+    2026-11-03: `gate run --repo C:/AI/_handoff` died inside render with
+    `UnicodeEncodeError: 'charmap' codec can't encode character '\\u2192'`. Every check had
+    already run. The crash came before the --json write and before the verdict line, so the
+    command exited 1 with no report and a 0-byte JSON file, which reads exactly like a red gate
+    to anything that only looks at the exit code. The arrow came from a KB file, and a check's
+    message quotes what it found, so any repository can do this to the gate.
+
+    The fixture puts a U+2192 next to a hardcoded Windows path in markdown, because that is the
+    shape that fired in the real repo. PYTHONIOENCODING=cp1252 reproduces the host's stdout
+    without needing a Windows console.
+    """
+
+    ARROW = "\u2192"
+
+    def files(self):
+        # A code line, not a comment: paths.py is strict (BLOCK) only for code, and the test needs
+        # a blocking finding so it can prove the whole report path survives, not just a warning.
+        return dict(CLEAN_PY, **{
+            "src/conf.py": f'BOARD = "serve the board on C:/dev/monitor {self.ARROW} 8420"\n'})
+
+    def test_cp1252_stdout_prints_a_verdict_instead_of_crashing(self):
+        code, out, data = self.run_gate(self.files(), "--only", "paths", "--offline", "--no-audit",
+                                        env={"PYTHONIOENCODING": "cp1252"})
+        self.assertNotIn("Traceback", out, out)
+        self.assertNotIn("UnicodeEncodeError", out, out)
+        self.assertIn("Verdict:", out, out)
+        self.assertIn(code, (0, 1, 2), out)
+
+    def test_cp1252_stdout_still_writes_the_json_report(self):
+        _code, out, data = self.run_gate(self.files(), "--only", "paths", "--offline", "--no-audit",
+                                         "--visibility", "public",
+                                         env={"PYTHONIOENCODING": "cp1252"})
+        self.assertTrue(data.get("checks"), f"--json must be written even when a message is unencodable:\n{out}")
+        self.assertEqual(status_of(data, "paths"), "fail", out)
+        self.assertTrue(open_blocks(data, "paths"), out)
+
+    def test_the_arrow_reaches_the_report_unchanged(self):
+        _code, out, _data = self.run_gate(self.files(), "--only", "paths", "--offline", "--no-audit",
+                                          env={"PYTHONIOENCODING": "cp1252"})
+        self.assertIn(self.ARROW, out, "the character should be printed as UTF-8, not escaped, when the stream allows it")
+
+
 if __name__ == "__main__":
     unittest.main()

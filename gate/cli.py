@@ -298,8 +298,69 @@ def run_checks(repo: Repo, names: list[str], a) -> list[Result]:
     return results
 
 
+class _SanitisedStream:
+    """A text stream whose encoding cannot carry every character, made unable to raise.
+
+    Anything its inner encoding cannot represent is rewritten as a backslash escape
+    (``\\u2192``) rather than raising. Used only when the stream itself cannot be
+    reconfigured to UTF-8.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    @property
+    def encoding(self):
+        return getattr(self._inner, "encoding", None)
+
+    def write(self, text: str):
+        enc = getattr(self._inner, "encoding", None)
+        if enc:
+            try:
+                text.encode(enc)
+            except UnicodeEncodeError:
+                text = text.encode(enc, "backslashreplace").decode(enc)
+        return self._inner.write(text)
+
+    def flush(self):
+        flush = getattr(self._inner, "flush", None)
+        if callable(flush):
+            flush()
+
+
+def safe_out(stream):
+    """`stream`, changed so that printing to it can never raise UnicodeEncodeError.
+
+    A finding's message quotes text taken from the repository, and a repository can contain any
+    character. stdout on Windows is cp1252 unless PYTHONIOENCODING or the console says otherwise,
+    and one U+2192 arrow in a KB file was enough to kill the gate: every check had already run,
+    `render` raised, and the caller never reached the --json write or the verdict line. The
+    command exited 1 with nothing behind it. A crash that mimics a verdict is the same defect as
+    a check that cannot tell and prints nothing.
+
+    UTF-8 is tried first, because that renders the character properly as well as not raising. A
+    stream that refuses reconfigure is wrapped instead, so the report still prints, with the
+    unrepresentable characters escaped. StringIO (contextlib.redirect_stdout) has no encoding and
+    is returned untouched.
+    """
+    enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+    if not enc or enc == "utf8":
+        return stream
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+            return stream
+        except (AttributeError, OSError, ValueError):
+            pass
+    return _SanitisedStream(stream)
+
+
 def render(repo: Repo, results: list[Result], out=None, max_items: int = 40) -> None:
-    out = out or sys.stdout  # resolved per call, so contextlib.redirect_stdout (gate_matrix.py) captures it
+    # `out` is resolved per call, so contextlib.redirect_stdout (gate_matrix.py) captures it.
+    # safe_out here, not at the caller, because this is where repository text reaches a print,
+    # and because a caller passing its own stream must get the same protection.
+    out = safe_out(out or sys.stdout)
     print(f"saluca merge gate: {repo.root.name}  ({dt.date.today().isoformat()})", file=out)
     print(f"{'check':<19}{'status':<13}{'block':>6}{'warn':>6}{'waived':>8}{'debt':>6}", file=out)
     for r in results:
