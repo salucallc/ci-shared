@@ -9,6 +9,9 @@
   python -m gate bootstrap             fetch pinned gitleaks, a pip-audit and bandit venv, and semgrep
                                        (a venv, or its Docker image on Windows) into ~/.cache
 
+The printed report truncates each check at 40 findings (`... N more`); the --json file is the full
+list and the contract for any tool or agent asking about a specific finding.
+
 Exit codes: 0 green (warnings allowed), 1 a blocking finding, 2 cannot tell. Cannot tell is
 never a pass. A red gate is never pushed. The standard is saluca-handoff
 KB/workflows/repo-merge-gate.md; requirement ids (SEC-1, CLM-3, ...) are its section ids.

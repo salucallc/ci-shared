@@ -299,6 +299,12 @@ $ python tools/gate.py bootstrap          # once: pinned gitleaks, a pip-audit a
 $ python tools/gate.py run --repo ../my-repo
 ```
 
+**The printed report is a summary; the finding list is `--json`.** The console shows at most 40
+findings per check and then `... N more (use --json for all)`. Grepping that log for a file proves
+nothing about the file: a finding past the cut is absent from the log and present in the verdict. To
+ask whether a specific file or change has a finding, read `gate.py run --repo . --json out.json` (every
+finding, untruncated), or run `gate.py fast FILE...` on the exact files, which does not truncate.
+
 or install the hooks in `.pre-commit-hooks.yaml` (`examples/pre-commit-config.yaml`): a fast
 pre-commit hook on staged files, and a pre-push hook that runs the whole gate.
 

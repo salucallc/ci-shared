@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 
 from ..core import BLOCK, WARN, Repo, Result
 
+REQ_FILE = re.compile(r"(^|/)[\w.-]*requirements[\w.-]*\.txt$")
 CACHE_PY = Path.home() / ".cache" / "saluca-gate" / "venv" / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
 
 
@@ -110,10 +111,14 @@ def run(repo: Repo, opts) -> Result:
     files = repo.tracked()
     names = set(files)
     pkgs = [f for f in files if PurePosixPath(f).name == "package.json"]
-    reqs = [f for f in files if re.search(r"(^|/)requirements[\w.-]*\.(txt|in)$", f) and not f.endswith(".in")]
+    # Any basename containing "requirements" and ending in .txt: requirements.txt, requirements-dev.txt,
+    # and also ci-requirements.txt or dev-requirements.txt. The old pattern demanded a basename that
+    # STARTS with "requirements", so life-os's .github/ci-requirements.txt (the whole CI toolchain, 41
+    # open advisories) was never audited and the check read n/a. Found 2026-11-04.
+    reqs = [f for f in files if REQ_FILE.search(f)]
     pyprojects = [f for f in files if PurePosixPath(f).name == "pyproject.toml"]
     if not (pkgs or reqs or pyprojects):
-        return r.na("no package.json, requirements*.txt or pyproject.toml")
+        return r.na("no package.json, *requirements*.txt or pyproject.toml")
     node_locks = []
     for pj in pkgs:
         d = str(PurePosixPath(pj).parent)
