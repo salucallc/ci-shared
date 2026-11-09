@@ -81,9 +81,9 @@ jobs:
             echo "::error::gate-ref must be a full 40-character commit SHA"; exit 1
           fi
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Checkout gate code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: salucallc/ci-shared
           ref: ${{ inputs.gate-ref != '' && inputs.gate-ref || github.sha }}
@@ -114,11 +114,11 @@ jobs:
                 log-redaction, consistency, mutation, bandit, semgrep, branch-protection]
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
       - name: Checkout gate code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: salucallc/ci-shared
           ref: ${{ inputs.gate-ref != '' && inputs.gate-ref || github.sha }}
