@@ -56,6 +56,16 @@ SEMGREP_TIMEOUT_SECONDS = "0"
 SEMGREP_CONFIGS = ("p/owasp-top-ten", "p/python", "p/secrets", "p/ci")
 SEMGREP_SEVERITY = "ERROR"
 SEMGREP_IMAGE = f"semgrep/semgrep:{SEMGREP_VERSION}"
+# Resource caps (2026-11-18). A Docker semgrep scan of one worktree took about 7 of the
+# workstation's 16 cores for 90 minutes and made the machine unusable for Cristian. The scan is
+# shared with a person at the keyboard, so it gets at most SEMGREP_MAX_CPUS cores, a low CPU
+# weight, a memory ceiling, and the same number of semgrep jobs. These limit speed, never coverage:
+# the per-target timeout stays 0, so a slower scan is still a complete scan.
+# GATE_SEMGREP_CPUS may only LOWER the core cap; a value above it is clamped, a non-integer raises.
+SEMGREP_MAX_CPUS = 4
+SEMGREP_MEMORY = "8g"
+SEMGREP_CPU_SHARES = "256"  # Docker's default is 1024: interactive work wins under contention
+SEMGREP_RUN_SECONDS = 3600
 
 CACHE = Path.home() / ".cache" / "saluca-gate"
 BANDIT_SUFFIXES = (".py", ".pyw")  # what `bandit -r` picks up
@@ -100,6 +110,35 @@ def bandit_command() -> tuple[list[str] | None, str]:
     return None, why + "; run `python -m gate bootstrap` (installs it into a venv under the gate cache) or set GATE_BANDIT"
 
 
+def semgrep_cpus() -> int:
+    """The core cap for one scan. GATE_SEMGREP_CPUS can only narrow SEMGREP_MAX_CPUS; an
+    unparseable value raises rather than falling back to a default."""
+    raw = os.environ.get("GATE_SEMGREP_CPUS")
+    if raw is None or raw.strip() == "":
+        return SEMGREP_MAX_CPUS
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        raise ValueError(f"GATE_SEMGREP_CPUS={raw!r} is not an integer") from None
+    return max(1, min(n, SEMGREP_MAX_CPUS))
+
+
+def docker_semgrep_prefix(docker: str, root: Path, name: str | None = None) -> list[str]:
+    """`docker run` for the pinned image, with the resource caps. `name` lets a timed-out scan be
+    removed: killing the docker CLI does NOT stop its container, which is how a scan outlived the
+    3600 s cap and kept 7 cores busy for 90 minutes."""
+    cmd = [docker, "run", "--rm"]
+    if name:
+        cmd += ["--name", name]
+    cmd += ["--cpus", str(semgrep_cpus()), "--cpu-shares", SEMGREP_CPU_SHARES, "--memory", SEMGREP_MEMORY,
+            "-v", f"{root}:/src", "-w", "/src", SEMGREP_IMAGE, "semgrep"]
+    return cmd
+
+
+def _container_name(cmd: list[str]) -> str | None:
+    return cmd[cmd.index("--name") + 1] if "--name" in cmd and cmd.index("--name") + 1 < len(cmd) else None
+
+
 def semgrep_command(root: Path) -> tuple[list[str] | None, str]:
     """The pinned semgrep as a command prefix run from `root`, or (None, why). Candidates:
     GATE_SEMGREP, the gate cache venv, PATH, then the official image under Docker (semgrep has no
@@ -121,10 +160,9 @@ def semgrep_command(root: Path) -> tuple[list[str] | None, str]:
         seen.append(f"{c} is {v or 'unknown'}")
     docker = shutil.which("docker")
     if docker and not os.environ.get("GATE_SEMGREP"):
-        cmd = [docker, "run", "--rm", "-v", f"{root}:/src", "-w", "/src", SEMGREP_IMAGE, "semgrep"]
-        v = _version(cmd, r"(\d+\.\d+\.\d+)")
+        v = _version(docker_semgrep_prefix(docker, root), r"(\d+\.\d+\.\d+)")
         if v == SEMGREP_VERSION:
-            return cmd, ""
+            return docker_semgrep_prefix(docker, root, f"saluca-gate-semgrep-{os.getpid()}-{os.urandom(4).hex()}"), ""
         seen.append(f"docker {SEMGREP_IMAGE} did not run ({v or 'no version printed; is the daemon up?'})")
     why = f"semgrep {SEMGREP_VERSION} not found" + (f" ({'; '.join(seen)})" if seen else "")
     return None, why + ("; run `python -m gate bootstrap`, install semgrep==" + SEMGREP_VERSION +
@@ -196,7 +234,8 @@ def semgrep_argv(cmd: list[str]) -> list[str]:
     for c in SEMGREP_CONFIGS:
         args += ["--config", c]
     return cmd + args + [f"--severity={SEMGREP_SEVERITY}", "--error", "--json", "--quiet",
-                         "--disable-version-check", "--timeout", SEMGREP_TIMEOUT_SECONDS, "."]
+                         "--disable-version-check", "--timeout", SEMGREP_TIMEOUT_SECONDS,
+                         "--jobs", str(semgrep_cpus()), "."]
 
 
 def run_semgrep(repo: Repo, opts) -> Result:
@@ -206,14 +245,24 @@ def run_semgrep(repo: Repo, opts) -> Result:
         return r.na("no tracked files")
     if getattr(opts, "offline", False):
         return r.cannot("--offline: semgrep fetches its rulepacks from the registry")
-    cmd, why = semgrep_command(repo.root)
+    try:
+        cmd, why = semgrep_command(repo.root)
+        argv = semgrep_argv(cmd) if cmd else None
+    except ValueError as e:
+        return r.cannot(str(e))
     if not cmd:
         return r.cannot(why)
     try:
-        out = subprocess.run(semgrep_argv(cmd),
+        out = subprocess.run(argv,
                              cwd=repo.root, capture_output=True,
-                             text=True, encoding="utf-8", errors="replace", timeout=3600)
+                             text=True, encoding="utf-8", errors="replace", timeout=SEMGREP_RUN_SECONDS)
     except (OSError, subprocess.TimeoutExpired) as e:
+        name = _container_name(cmd)
+        if name:  # the CLI is dead; its container is not
+            try:
+                subprocess.run([cmd[0], "rm", "-f", name], capture_output=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         return r.cannot(f"semgrep did not run: {type(e).__name__}: {e}")
     if out.returncode not in (0, 1):
         return r.cannot(f"semgrep exited {out.returncode} (0 clean, 1 findings; anything else is an error): "

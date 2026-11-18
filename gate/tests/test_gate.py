@@ -1582,6 +1582,90 @@ class Semgrep(Base):
         self.assertIn("--timeout", argv)
         self.assertEqual(argv[argv.index("--timeout") + 1], "0", argv)
 
+    def test_docker_semgrep_is_resource_capped(self):
+        """2026-11-18: an uncapped Docker scan held ~7 of 16 cores for 90 minutes on the
+        workstation Cristian works at. The Docker form carries a core cap, a low CPU weight, a
+        memory ceiling and a name; semgrep runs as many jobs as the cap."""
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GATE_SEMGREP", None)
+            os.environ.pop("GATE_SEMGREP_CPUS", None)
+            with mock.patch.object(sast_mod.shutil, "which", side_effect=lambda n: "docker" if n == "docker" else None), \
+                    mock.patch.object(sast_mod, "_version", return_value=sast_mod.SEMGREP_VERSION):
+                cmd, why = sast_mod.semgrep_command(Path("fake-repo-root"))
+        self.assertIsNotNone(cmd, why)
+        self.assertEqual(cmd[cmd.index("--cpus") + 1], str(sast_mod.SEMGREP_MAX_CPUS), cmd)
+        self.assertLessEqual(sast_mod.SEMGREP_MAX_CPUS, 4)
+        self.assertEqual(cmd[cmd.index("--cpu-shares") + 1], "256", cmd)
+        self.assertIn("--memory", cmd)
+        self.assertTrue(cmd[cmd.index("--name") + 1].startswith("saluca-gate-semgrep-"), cmd)
+        self.assertLess(cmd.index("--cpus"), cmd.index(sast_mod.SEMGREP_IMAGE), "docker flags must precede the image")
+        argv = sast_mod.semgrep_argv(["semgrep"])
+        self.assertEqual(argv[argv.index("--jobs") + 1], str(sast_mod.SEMGREP_MAX_CPUS), argv)
+
+    def test_semgrep_cpu_env_only_narrows(self):
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+
+        with mock.patch.dict(os.environ, {"GATE_SEMGREP_CPUS": "99"}):
+            self.assertEqual(sast_mod.semgrep_cpus(), sast_mod.SEMGREP_MAX_CPUS)
+        with mock.patch.dict(os.environ, {"GATE_SEMGREP_CPUS": "2"}):
+            self.assertEqual(sast_mod.semgrep_cpus(), 2)
+        with mock.patch.dict(os.environ, {"GATE_SEMGREP_CPUS": "0"}):
+            self.assertEqual(sast_mod.semgrep_cpus(), 1)
+        with mock.patch.dict(os.environ, {"GATE_SEMGREP_CPUS": "lots"}):
+            with self.assertRaises(ValueError):
+                sast_mod.semgrep_cpus()
+
+    def test_unparseable_cpu_cap_is_cannot_tell(self):
+        import types
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+        from gate.core import Repo as CoreRepo
+
+        repo = GateRepo(dict(CLEAN_PY))
+        self.addCleanup(repo.close)
+        clean = mock.Mock(returncode=0, stdout=json.dumps({"results": [], "errors": []}), stderr="")
+        with mock.patch.dict(os.environ, {"GATE_SEMGREP_CPUS": "lots"}), \
+                mock.patch.object(sast_mod, "semgrep_command", return_value=(["semgrep"], "")), \
+                mock.patch.object(sast_mod.subprocess, "run", return_value=clean) as run:
+            res = sast_mod.run_semgrep(CoreRepo(repo.path, files=["src/run.py"]), types.SimpleNamespace(offline=False))
+        self.assertEqual(res.status, "cannot-tell", res.notes)
+        self.assertIn("GATE_SEMGREP_CPUS", " ".join(res.notes))
+        run.assert_not_called()
+
+    def test_timed_out_docker_scan_removes_its_container(self):
+        """Killing the docker CLI on timeout leaves the container running. The gate removes it
+        by name, and the result is still cannot tell."""
+        import subprocess as sp
+        import types
+        from unittest import mock
+
+        from gate.checks import sast as sast_mod
+        from gate.core import Repo as CoreRepo
+
+        repo = GateRepo(dict(CLEAN_PY))
+        self.addCleanup(repo.close)
+        cmd = ["docker", "run", "--rm", "--name", "saluca-gate-semgrep-1-ab", "img", "semgrep"]
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if len(calls) == 1:
+                raise sp.TimeoutExpired(argv, 1)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(sast_mod, "semgrep_command", return_value=(cmd, "")), \
+                mock.patch.object(sast_mod.subprocess, "run", side_effect=fake_run):
+            res = sast_mod.run_semgrep(CoreRepo(repo.path, files=["src/run.py"]), types.SimpleNamespace(offline=False))
+        self.assertEqual(res.status, "cannot-tell", res.notes)
+        self.assertIn(["docker", "rm", "-f", "saluca-gate-semgrep-1-ab"], calls, calls)
+
     def test_a_semgrep_error_is_cannot_tell_not_a_pass(self):
         """A semgrep error means part of the tree was NOT analysed, so the absence of a finding
         there proves nothing. This was a note on a passing check; that is how the same command on
