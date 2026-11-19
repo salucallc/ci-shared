@@ -1996,7 +1996,7 @@ class SemgrepOrphans(unittest.TestCase):
         else:
             self.docker = str(t / "docker")
             Path(self.docker).write_text(f'#!/bin/sh\nexec "{sys.executable}" "{t / "fakedocker.py"}" "$@"\n', encoding="utf-8")
-            os.chmod(self.docker, 0o755)
+            Path(self.docker).chmod(0o755)
         self.repo = t / "repo"
         self.repo.mkdir()
         (self.repo / "a.py").write_text("x = 1\n", encoding="utf-8")
@@ -2170,8 +2170,8 @@ class SemgrepGuard(unittest.TestCase):
 
     def setUp(self):
         import shutil
-        if not shutil.which("sh"):
-            self.skipTest("no sh on PATH: the guard cannot be exercised here (it runs under sh inside the semgrep image)")
+        # Not a skip: without sh the guard is untested, and cannot tell is never a pass. Git for Windows ships one.
+        self.assertTrue(shutil.which("sh"), "no sh on PATH: the guard (it runs under sh inside the semgrep image) cannot be exercised")
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         t = Path(self.tmp.name)
