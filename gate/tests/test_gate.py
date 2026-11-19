@@ -1006,6 +1006,22 @@ class Licence(Base):
         self.assertFails(dict(CLEAN_PY, **{"LICENSE": busl, "README.md": readme.replace("2030-01-01.", "2030-01-01. The sdk is MIT.")}),
                          "licence", "README.md License section says MIT")
 
+    PROPRIETARY = "Copyright (c) 2026 Saluca. All rights reserved.\n"
+
+    def _proprietary(self, declared_id):
+        readme = CLEAN_PY["README.md"].replace("MIT, see LICENSE.", "Proprietary. All rights reserved, see LICENSE.")
+        return dict(CLEAN_PY, **{"LICENSE": self.PROPRIETARY, "README.md": readme,
+                                 "pyproject.toml": f'[project]\nname = "demo"\nlicense = "{declared_id}"\n'})
+
+    def test_saluca_proprietary_id_matches_a_proprietary_licence_file(self):
+        # licence-signer / asphodel-py, 2026-11-18: the estate's SPDX id for a proprietary licence is
+        # LicenseRef-Saluca-Proprietary; the gate read the same LICENSE text as LicenseRef-Proprietary and blocked it
+        self.assertPasses(self._proprietary("LicenseRef-Saluca-Proprietary"), "licence", allow=("pass",))
+
+    def test_other_ids_still_mismatch_a_proprietary_licence_file(self):
+        self.assertFails(self._proprietary("MIT"), "licence", "LIC-2: pyproject.toml says MIT")
+        self.assertFails(self._proprietary("LicenseRef-Someone-Else"), "licence", "LIC-2")
+
     def test_consistent_passes(self):
         files = dict(CLEAN_PY, **{"package.json": json.dumps({"name": "demo", "license": "MIT"})})
         self.assertPasses(files, "licence", allow=("pass",))
