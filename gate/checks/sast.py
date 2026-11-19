@@ -22,13 +22,18 @@ gate's own checkout in CI (`.merge-gate/`) is not scanned as if it were the repo
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
+import tarfile
+import threading
+import time
 from pathlib import Path
 
 from ..core import BLOCK, WARN, Repo, Result
@@ -66,6 +71,44 @@ SEMGREP_MAX_CPUS = 4
 SEMGREP_MEMORY = "8g"
 SEMGREP_CPU_SHARES = "256"  # Docker's default is 1024: interactive work wins under contention
 SEMGREP_RUN_SECONDS = 3600
+# The scan reads a COPY of the tracked files, not a bind mount (2026-11-19). Measured on saluca-content (4,333 tracked
+# files): `semgrep` over a Docker Desktop bind mount of the Windows checkout used about 0.1 of a core and had not
+# finished after 20 minutes (three gate runs killed by their caller's `timeout`, exit 124, each leaving a container);
+# the same scan over the same files streamed into the container as a tar finished in 30 seconds with the same 28
+# findings and no errors. The bind mount's per-file latency, not semgrep's analysis, was the whole cost. The tar holds
+# exactly the tracked files the gate reads (working-tree content, so uncommitted edits count), without the files
+# semgrep itself skips as too large, so what is scanned is what a CI checkout would scan.
+SEMGREP_MAX_TARGET_BYTES = 1_000_000   # semgrep's own default --max-target-bytes: larger files are skipped by it anyway
+SEMGREP_UNPACK = 'mkdir -p /src && cd /src && tar x || { echo "saluca-gate: could not unpack the sources" >&2; exit 2; }; '
+
+# Orphaned scans (2026-11-19). The cap above only helps when THIS process survives to enforce it. A caller's
+# `timeout 1200 python gate.py` (exit 124) kills the gate with no chance to clean up, `docker run` is only a client,
+# and the container goes on holding 4 cores until it finishes, so three timed-out gate runs on saluca-content left
+# three scans running. Three layers, each covering what the one before cannot:
+#   1. the container watches its owner: the gate writes a heartbeat file (a counter, every SEMGREP_BEAT_SECONDS) into a
+#      directory mounted read-only at /hb, and the guard script inside the container kills semgrep and exits when the
+#      counter has not changed for SEMGREP_STALE_SECONDS. A gate killed by `timeout` stops beating, so its scan ends
+#      within minutes, not an hour. Backstop: busybox `timeout -s KILL` a minute after the host-side cap;
+#   2. the gate removes its container when it exits any way it can notice (exception, SIGINT, SIGTERM, SIGBREAK);
+#   3. every run begins by removing scans whose owner is gone: labelled `saluca-gate=semgrep`, with the owner's pid
+#      and start time, an orphan is a labelled container whose owner pid is dead or that outlived the cap.
+SEMGREP_LABEL = "saluca-gate=semgrep"
+SEMGREP_SELF_KILL_SECONDS = SEMGREP_RUN_SECONDS + 60
+SEMGREP_ORPHAN_AGE_SECONDS = SEMGREP_SELF_KILL_SECONDS + 120
+SEMGREP_BEAT_SECONDS = 15
+SEMGREP_STALE_SECONDS = 180
+# The guard the container runs instead of bare semgrep. It compares the heartbeat's CONTENT, not its mtime, so a clock
+# that differs between the host and the container's VM cannot make a live gate look dead. $@ is semgrep's arguments.
+# GATE_HB_FILE, GATE_HB_STALE and GATE_HB_POLL exist so a test can use seconds instead of minutes; the defaults are the constants.
+SEMGREP_GUARD = (
+    'timeout -s KILL "${GATE_HB_DEADLINE:-%d}" semgrep "$@" & p=$!; last=; since=$(date +%%s); '
+    'while kill -0 $p 2>/dev/null; do '
+    'cur=$(cat "${GATE_HB_FILE:-/hb/beat}" 2>/dev/null); now=$(date +%%s); '
+    '[ "$cur" != "$last" ] && last=$cur && since=$now; '
+    'if [ $((now - since)) -gt "${GATE_HB_STALE:-%d}" ]; then '
+    'echo "saluca-gate: owner heartbeat lost, semgrep killed" >&2; kill -9 $p 2>/dev/null; wait $p 2>/dev/null; exit 124; fi; '
+    'sleep "${GATE_HB_POLL:-5}"; done; wait $p; exit $?'
+) % (SEMGREP_SELF_KILL_SECONDS, SEMGREP_STALE_SECONDS)
 
 CACHE = Path.home() / ".cache" / "saluca-gate"
 BANDIT_SUFFIXES = (".py", ".pyw")  # what `bandit -r` picks up
@@ -129,10 +172,187 @@ def docker_semgrep_prefix(docker: str, root: Path, name: str | None = None) -> l
     3600 s cap and kept 7 cores busy for 90 minutes."""
     cmd = [docker, "run", "--rm"]
     if name:
-        cmd += ["--name", name]
-    cmd += ["--cpus", str(semgrep_cpus()), "--cpu-shares", SEMGREP_CPU_SHARES, "--memory", SEMGREP_MEMORY,
-            "-v", f"{root}:/src", "-w", "/src", SEMGREP_IMAGE, "semgrep"]
-    return cmd
+        cmd += ["--name", name, "--label", SEMGREP_LABEL, "--label", f"saluca-gate-pid={os.getpid()}",
+                "--label", f"saluca-gate-started={int(time.time())}"]
+    cmd += ["--cpus", str(semgrep_cpus()), "--cpu-shares", SEMGREP_CPU_SHARES, "--memory", SEMGREP_MEMORY]
+    if not name:  # the version probe reads nothing of the repo
+        return cmd + ["-v", f"{root}:/src", "-w", "/src", SEMGREP_IMAGE, "semgrep"]
+    # The real scan: the sources arrive on stdin as a tar (see pack_sources), and it runs under the guard, so it ends
+    # even when the gate that started it was killed without a chance to remove it.
+    hb = CACHE / "heartbeats" / name
+    hb.mkdir(parents=True, exist_ok=True)
+    (hb / "beat").write_text("0", encoding="utf-8")
+    cmd.insert(2, "-i")
+    return cmd + ["-v", f"{hb}:/hb:ro", "-w", "/", SEMGREP_IMAGE, "sh", "-c", SEMGREP_UNPACK + SEMGREP_GUARD,
+                  "saluca-gate-guard"]
+
+
+def pack_sources(repo: Repo, dest: Path) -> tuple[int, int]:
+    """Write the tracked files the gate reads, as the working tree has them, to the tar `dest`: (packed, too large).
+    Files over SEMGREP_MAX_TARGET_BYTES are left out because semgrep skips them. A tracked file that is gone from the
+    working tree is left out (the bind mount did not have it either); any other read error raises OSError, and the
+    caller turns it into cannot tell rather than scanning a partial copy."""
+    packed = big = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(dest, "w") as tf:
+        for rel in repo.tracked():
+            f = repo.root / rel
+            try:
+                st = f.lstat()
+            except FileNotFoundError:
+                continue
+            if f.is_symlink() or not f.is_file():
+                continue
+            if st.st_size > SEMGREP_MAX_TARGET_BYTES:
+                big += 1
+                continue
+            tf.add(str(f), arcname=rel.replace("\\", "/"), recursive=False)
+            packed += 1
+    return packed, big
+
+
+def _heartbeat_file(cmd: list[str]) -> Path | None:
+    for i, a in enumerate(cmd):
+        if a == "-v" and i + 1 < len(cmd) and cmd[i + 1].endswith(":/hb:ro"):
+            return Path(cmd[i + 1][: -len(":/hb:ro")]) / "beat"
+    return None
+
+
+@contextlib.contextmanager
+def heartbeat(cmd: list[str]):
+    """While the block runs, write an increasing counter to the scan's heartbeat file every SEMGREP_BEAT_SECONDS."""
+    f = _heartbeat_file(cmd)
+    if f is None:
+        yield
+        return
+    stop = threading.Event()
+
+    def beat():
+        n = 0
+        while not stop.wait(SEMGREP_BEAT_SECONDS):
+            n += 1
+            try:
+                f.write_text(str(n), encoding="utf-8")
+            except OSError:
+                pass  # a missed beat is tolerated; STALE_SECONDS is many beats
+
+    t = threading.Thread(target=beat, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        shutil.rmtree(f.parent, ignore_errors=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is `pid` a running process? Cannot tell counts as alive: a live gate's scan must never be removed."""
+    if pid <= 0:
+        return False
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return k32.GetLastError() == 5  # access denied: it exists
+            try:
+                code = ctypes.c_ulong()
+                return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:  # noqa: BLE001
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def reap_orphan_scans(docker: str, now: float | None = None) -> list[str]:
+    """Remove semgrep containers the gate started whose owner is gone: the owner pid is dead, or the scan is older than
+    its own deadline. Returns the names removed. Best effort by design: a docker that cannot be asked removes nothing,
+    and a container of a LIVE gate (another terminal, CI on this host) is left alone."""
+    now = time.time() if now is None else now
+    try:
+        out = subprocess.run([docker, "ps", "--filter", f"label={SEMGREP_LABEL}", "--format",
+                              '{{.Names}}|{{.Label "saluca-gate-pid"}}|{{.Label "saluca-gate-started"}}'],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    _prune_cache(now)
+    removed = []
+    for line in out.stdout.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 3 or not parts[0]:
+            continue
+        name, pid_s, started_s = parts
+        try:
+            pid, started = int(pid_s), int(started_s)
+        except ValueError:
+            continue  # not ours to judge
+        if _pid_alive(pid) and now - started <= SEMGREP_ORPHAN_AGE_SECONDS:
+            continue
+        if _rm_container(docker, name):
+            removed.append(name)
+    return removed
+
+
+def _prune_cache(now: float) -> None:
+    """Heartbeat directories and source tars left by a gate that was killed without cleanup, once a day old."""
+    for d in (CACHE / "heartbeats", CACHE / "src-tars"):
+        try:
+            for p in d.iterdir():
+                if now - p.stat().st_mtime > 86400:
+                    shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _rm_container(docker: str, name: str) -> bool:
+    try:
+        return subprocess.run([docker, "rm", "-f", name], capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+class GateInterrupted(SystemExit):
+    """Raised by the signal handler so the stack unwinds (subprocess.run kills its child, `finally` removes the
+    container) instead of the process dying with the scan still running."""
+
+
+@contextlib.contextmanager
+def removes_container_on_exit(cmd: list[str]):
+    """However the block ends - normally, by an exception, SIGINT, SIGTERM or SIGBREAK - the named scan container is
+    removed. (A kill that gives no chance to run any of this is what the self-kill and the orphan reaper are for.)"""
+    name = _container_name(cmd)
+    if not name:
+        yield
+        return
+    saved = {}
+    if threading.current_thread() is threading.main_thread():
+        def handler(signum, _frame):
+            raise GateInterrupted(128 + signum)
+        for sig in (getattr(signal, n, None) for n in ("SIGINT", "SIGTERM", "SIGBREAK")):
+            if sig is not None:
+                try:
+                    saved[sig] = signal.signal(sig, handler)
+                except (OSError, ValueError):
+                    pass
+    try:
+        yield
+    finally:
+        for sig, old in saved.items():
+            try:
+                signal.signal(sig, old)
+            except (OSError, ValueError):
+                pass
+        _rm_container(cmd[0], name)
 
 
 def _container_name(cmd: list[str]) -> str | None:
@@ -252,18 +472,29 @@ def run_semgrep(repo: Repo, opts) -> Result:
         return r.cannot(str(e))
     if not cmd:
         return r.cannot(why)
+    if _container_name(cmd):
+        reaped = reap_orphan_scans(cmd[0])
+        if reaped:
+            r.notes.append(f"removed {len(reaped)} orphaned semgrep container(s) of earlier gate runs: {', '.join(reaped)}")
+    name = _container_name(cmd)
+    tar_path = CACHE / "src-tars" / f"{name}.tar" if name else None
+    stdin = None
     try:
-        out = subprocess.run(argv,
-                             cwd=repo.root, capture_output=True,
-                             text=True, encoding="utf-8", errors="replace", timeout=SEMGREP_RUN_SECONDS)
+        if tar_path is not None:
+            packed, big = pack_sources(repo, tar_path)
+            r.notes.append(f"scanned a copy of {packed} tracked file(s) ({big} over {SEMGREP_MAX_TARGET_BYTES} bytes left "
+                           "to semgrep's own size skip)")
+            stdin = tar_path.open("rb")
+        with removes_container_on_exit(cmd), heartbeat(cmd):  # the CLI dying does not stop its container; this does
+            out = subprocess.run(argv, cwd=repo.root, stdin=stdin, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=SEMGREP_RUN_SECONDS)
     except (OSError, subprocess.TimeoutExpired) as e:
-        name = _container_name(cmd)
-        if name:  # the CLI is dead; its container is not
-            try:
-                subprocess.run([cmd[0], "rm", "-f", name], capture_output=True, timeout=60)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
         return r.cannot(f"semgrep did not run: {type(e).__name__}: {e}")
+    finally:
+        if stdin is not None:
+            stdin.close()
+        if tar_path is not None:
+            tar_path.unlink(missing_ok=True)
     if out.returncode not in (0, 1):
         return r.cannot(f"semgrep exited {out.returncode} (0 clean, 1 findings; anything else is an error): "
                         f"{(out.stderr or out.stdout).strip()[-400:]}")

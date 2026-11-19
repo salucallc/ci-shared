@@ -1947,5 +1947,281 @@ class RenderEncoding(Base):
         self.assertIn(self.ARROW, out, "the character should be printed as UTF-8, not escaped, when the stream allows it")
 
 
+class SemgrepOrphans(unittest.TestCase):
+    """2026-11-19: a caller's `timeout 1200 python gate.py` killed three gate runs on saluca-content and each left its
+    semgrep container running. `docker run` is a client, so a killed gate cannot stop it. These tests drive the real
+    run_semgrep against a fake docker that keeps a marker file per "running container" (a hard-killed owner leaves the
+    marker behind, exactly like the real container), and prove each of the three layers."""
+
+    FAKE = textwrap.dedent('''
+        import os, sys, time
+        state = os.environ["FAKE_DOCKER_STATE"]
+        a = sys.argv[1:]
+        def lab(k):
+            for i, x in enumerate(a):
+                if x == "--label" and a[i + 1].startswith(k + "="):
+                    return a[i + 1].split("=", 1)[1]
+            return ""
+        if a[:1] == ["run"]:
+            name = a[a.index("--name") + 1]
+            with open(os.path.join(state, name + ".running"), "w") as f:
+                f.write(lab("saluca-gate-pid") + "|" + lab("saluca-gate-started"))
+            for _ in range(600):            # "running" until a `docker rm -f` removes it (bounded: never a stray process)
+                if not os.path.exists(os.path.join(state, name + ".running")):
+                    break
+                time.sleep(0.2)
+        elif a[:1] == ["ps"]:
+            for fn in sorted(os.listdir(state)):
+                if fn.endswith(".running"):
+                    pid, started = open(os.path.join(state, fn)).read().split("|")
+                    print(fn[:-8] + "|" + pid + "|" + started)
+        elif a[:2] == ["rm", "-f"]:
+            p = os.path.join(state, a[2] + ".running")
+            if os.path.exists(p):
+                os.remove(p)
+                sys.exit(0)
+            sys.exit(1)
+        ''')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        t = Path(self.tmp.name)
+        self.state = t / "state"
+        self.state.mkdir()
+        (t / "fakedocker.py").write_text(self.FAKE, encoding="utf-8")
+        if os.name == "nt":
+            self.docker = str(t / "docker.cmd")
+            Path(self.docker).write_text(f'@"{sys.executable}" "{t / "fakedocker.py"}" %*\r\n', encoding="utf-8")
+        else:
+            self.docker = str(t / "docker")
+            Path(self.docker).write_text(f'#!/bin/sh\nexec "{sys.executable}" "{t / "fakedocker.py"}" "$@"\n', encoding="utf-8")
+            os.chmod(self.docker, 0o755)
+        self.repo = t / "repo"
+        self.repo.mkdir()
+        (self.repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self.env = dict(os.environ, FAKE_DOCKER_STATE=str(self.state), PYTHONPATH=str(ROOT))
+        from unittest import mock
+        patcher = mock.patch.dict(os.environ, {"FAKE_DOCKER_STATE": str(self.state)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def markers(self):
+        return sorted(p.name for p in self.state.glob("*.running"))
+
+    def start_gate(self):
+        """A child process running the real run_semgrep, whose "docker run" blocks; returns it once the container exists."""
+        import time
+        code = textwrap.dedent(f'''
+            import sys, types
+            from pathlib import Path
+            from unittest import mock
+            from gate.checks import sast
+            from gate.core import Repo
+            cmd = sast.docker_semgrep_prefix({self.docker!r}, Path({str(self.repo)!r}), "saluca-gate-semgrep-test-1")
+            with mock.patch.object(sast, "semgrep_command", return_value=(cmd, "")):
+                res = sast.run_semgrep(Repo(Path({str(self.repo)!r}), files=["a.py"]), types.SimpleNamespace(offline=False))
+            print("RESULT", res.status)
+            ''')
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        p = subprocess.Popen([sys.executable, "-c", code], env=self.env, cwd=ROOT, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, creationflags=flags)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        deadline = time.time() + 60
+        while not self.markers() and time.time() < deadline:
+            time.sleep(0.2)
+        self.assertEqual(self.markers(), ["saluca-gate-semgrep-test-1.running"], "the scan container never started")
+        return p
+
+    def test_a_gate_stopped_by_a_signal_removes_its_container(self):
+        import signal as sg
+        import time
+        p = self.start_gate()
+        p.send_signal(sg.CTRL_BREAK_EVENT if os.name == "nt" else sg.SIGTERM)
+        p.wait(timeout=60)
+        deadline = time.time() + 20
+        while self.markers() and time.time() < deadline:
+            time.sleep(0.2)
+        self.assertEqual(self.markers(), [], "a stopped gate left its semgrep container running")
+
+    def test_a_hard_killed_gate_leaves_one_and_the_next_gate_removes_it(self):
+        from gate.checks import sast
+        p = self.start_gate()
+        p.kill()                       # no handler runs: this is `timeout` killing the gate (exit 124)
+        p.wait(timeout=60)
+        self.assertEqual(self.markers(), ["saluca-gate-semgrep-test-1.running"], "the fake must model a surviving container")
+        self.assertEqual(sast.reap_orphan_scans(self.docker), ["saluca-gate-semgrep-test-1"])
+        self.assertEqual(self.markers(), [])
+
+    def test_a_live_gates_container_is_not_reaped_but_an_overdue_one_is(self):
+        import time
+        from gate.checks import sast
+        now = int(time.time())
+        (self.state / "mine.running").write_text(f"{os.getpid()}|{now}", encoding="utf-8")       # owner alive, young
+        self.assertEqual(sast.reap_orphan_scans(self.docker), [])
+        self.assertEqual(self.markers(), ["mine.running"])
+        (self.state / "mine.running").write_text(f"{os.getpid()}|{now - sast.SEMGREP_ORPHAN_AGE_SECONDS - 5}",
+                                                 encoding="utf-8")                              # owner alive, past its own deadline
+        self.assertEqual(sast.reap_orphan_scans(self.docker), ["mine"])
+        (self.state / "junk.running").write_text("not|numbers", encoding="utf-8")                # unparseable: not ours to judge
+        self.assertEqual(sast.reap_orphan_scans(self.docker), [])
+        self.assertEqual(self.markers(), ["junk.running"])
+
+    def test_an_unreachable_docker_reaps_nothing_and_does_not_raise(self):
+        from gate.checks import sast
+        self.assertEqual(sast.reap_orphan_scans(str(Path(self.tmp.name) / "no-such-docker")), [])
+
+    def test_the_container_carries_its_own_deadline_and_its_owner_labels(self):
+        from gate.checks import sast
+        cmd = sast.docker_semgrep_prefix("docker", Path("r"), "saluca-gate-semgrep-x")
+        i = cmd.index(sast.SEMGREP_IMAGE)
+        self.assertEqual(cmd[i + 1:i + 3], ["sh", "-c"])
+        self.assertIn(f'timeout -s KILL "${{GATE_HB_DEADLINE:-{sast.SEMGREP_SELF_KILL_SECONDS}}}" semgrep', cmd[i + 3])
+        self.assertIn("/hb", cmd[i + 3])
+        self.assertGreater(sast.SEMGREP_SELF_KILL_SECONDS, sast.SEMGREP_RUN_SECONDS)
+        self.assertIn(sast.SEMGREP_LABEL, cmd)
+        self.assertIn(f"saluca-gate-pid={os.getpid()}", cmd)
+        self.assertLess(cmd.index("--label"), i, "docker flags must precede the image")
+        probe = sast.docker_semgrep_prefix("docker", Path("r"))          # the version probe is not a scan
+        self.assertEqual(probe[-1], "semgrep")
+        self.assertNotIn("timeout", probe)
+
+
+class SemgrepSourceCopy(unittest.TestCase):
+    """The scan reads a tar of the tracked files streamed on stdin, not a Windows bind mount (30 s versus more than 20
+    minutes on saluca-content, same findings), and the container watches its owner's heartbeat."""
+
+    def repo(self):
+        r = GateRepo(dict(CLEAN_PY, **{"src/big.bin": b"x" * 1_000_001, "src/gone.py": "g = 1\n"}))
+        self.addCleanup(r.close)
+        self.tracked = r._out("ls-files").splitlines()
+        r.write({"src/calc.py": "def add(a, b):\n    return a + b + 1\n"})      # an uncommitted edit
+        r.write({"src/untracked.py": "u = 1\n"})                                  # never tracked
+        (r.path / "src" / "gone.py").unlink()                                      # tracked, deleted from the tree
+        return r
+
+    def test_the_tar_holds_working_tree_content_of_tracked_files_semgrep_would_read(self):
+        from gate.checks import sast
+        from gate.core import Repo as CoreRepo
+        r = self.repo()
+        dest = r.path.parent / f"{r.path.name}-src.tar"
+        self.addCleanup(lambda: dest.unlink(missing_ok=True))
+        packed, big = sast.pack_sources(CoreRepo(r.path, files=self.tracked), dest)
+        import tarfile
+        with tarfile.open(dest) as tf:
+            names = sorted(tf.getnames())
+            calc = tf.extractfile("src/calc.py").read().decode()
+        self.assertIn("src/calc.py", names)
+        self.assertIn("a + b + 1", calc, "the working-tree edit, not the committed blob")
+        self.assertNotIn("src/untracked.py", names)
+        self.assertNotIn("src/big.bin", names)
+        self.assertNotIn("src/gone.py", names)
+        self.assertEqual((packed, big), (len(names), 1))
+
+    def test_the_real_scan_gets_the_tar_on_stdin_and_no_bind_mount_and_leaves_no_file_behind(self):
+        import types
+        from unittest import mock
+        from gate.checks import sast
+        from gate.core import Repo as CoreRepo
+        r = self.repo()
+        seen = {}
+
+        def fake(argv, **kw):
+            if "stdin" not in kw:       # the container removal in `finally`, not the scan
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            seen["argv"], seen["kw"] = argv, kw
+            import tarfile
+            with tarfile.open(fileobj=kw["stdin"], mode="r|") as tf:
+                seen["names"] = tf.getnames()
+            return mock.Mock(returncode=0, stdout=json.dumps({"results": [], "errors": []}), stderr="")
+
+        cmd = sast.docker_semgrep_prefix("docker", r.path, "saluca-gate-semgrep-copytest")
+        with mock.patch.object(sast, "semgrep_command", return_value=(cmd, "")), \
+                mock.patch.object(sast, "reap_orphan_scans", return_value=[]), \
+                mock.patch.object(sast.subprocess, "run", side_effect=fake):
+            res = sast.run_semgrep(CoreRepo(r.path, files=self.tracked), types.SimpleNamespace(offline=False))
+        self.assertEqual(res.status, "pass", res.notes)
+        self.assertIn("src/calc.py", seen["names"])
+        self.assertIn("-i", seen["argv"])
+        self.assertFalse([a for a in seen["argv"] if a.endswith(":/src")], "no bind mount of the checkout")
+        self.assertFalse((sast.CACHE / "src-tars" / "saluca-gate-semgrep-copytest.tar").exists())
+        self.assertFalse((sast.CACHE / "heartbeats" / "saluca-gate-semgrep-copytest").exists())
+        self.assertIn("scanned a copy of", " ".join(res.notes))
+
+    def test_an_unreadable_tracked_file_is_cannot_tell_not_a_partial_scan(self):
+        import types
+        from unittest import mock
+        from gate.checks import sast
+        from gate.core import Repo as CoreRepo
+        r = self.repo()
+        cmd = sast.docker_semgrep_prefix("docker", r.path, "saluca-gate-semgrep-copytest2")
+        with mock.patch.object(sast, "semgrep_command", return_value=(cmd, "")), \
+                mock.patch.object(sast, "reap_orphan_scans", return_value=[]), \
+                mock.patch.object(sast.tarfile.TarFile, "add", side_effect=PermissionError("denied")), \
+                mock.patch.object(sast.subprocess, "run", side_effect=AssertionError("no scan on a partial copy")):
+            res = sast.run_semgrep(CoreRepo(r.path, files=self.tracked), types.SimpleNamespace(offline=False))
+        self.assertEqual(res.status, "cannot-tell", res.notes)
+        self.assertFalse((sast.CACHE / "src-tars" / "saluca-gate-semgrep-copytest2.tar").exists())
+
+
+class SemgrepGuard(unittest.TestCase):
+    """The script the container runs under: it must end semgrep when the owner's heartbeat stops, keep it running while
+    the heartbeat moves, and pass semgrep's own exit code through. Run here under a real `sh` with a fake semgrep."""
+
+    def setUp(self):
+        import shutil
+        if not shutil.which("sh"):
+            self.skipTest("no sh on PATH: the guard cannot be exercised here (it runs under sh inside the semgrep image)")
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        t = Path(self.tmp.name)
+        bin_ = t / "bin"
+        bin_.mkdir()
+        (bin_ / "semgrep").write_text('#!/bin/sh\n[ -n \"$FAKE_SEMGREP_HANG\" ] && exec sleep 120\nsleep "${FAKE_SEMGREP_SLEEP:-120}"\nexit "${FAKE_SEMGREP_RC:-0}"\n', encoding="utf-8", newline="\n")
+        (bin_ / "timeout").write_text('#!/bin/sh\nshift 3\nexec "$@"\n', encoding="utf-8", newline="\n")
+        for f in bin_.iterdir():
+            f.chmod(0o755)
+        self.beat = t / "beat"
+        self.beat.write_text("0", encoding="utf-8")
+        self.env = dict(os.environ, PATH=str(bin_) + os.pathsep + os.environ.get("PATH", ""),
+                        GATE_HB_FILE=str(self.beat).replace("\\", "/"), GATE_HB_STALE="4", GATE_HB_POLL="1")
+
+    def guard(self, **env):
+        from gate.checks import sast
+        return subprocess.Popen(["sh", "-c", sast.SEMGREP_GUARD, "saluca-gate-guard", "--config", "x"], env=dict(self.env, **env),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_a_dead_owner_ends_semgrep_within_seconds_with_exit_124(self):
+        import time
+        t0 = time.time()
+        p = self.guard(FAKE_SEMGREP_HANG="1")
+        out, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 124, err)
+        self.assertIn("heartbeat lost", err)
+        self.assertLess(time.time() - t0, 30)
+
+    def test_a_beating_owner_keeps_it_running_and_semgrep_exit_code_comes_through(self):
+        import threading
+        import time
+        stop = threading.Event()
+
+        def beat():
+            n = 0
+            while not stop.wait(0.5):
+                n += 1
+                self.beat.write_text(str(n), encoding="utf-8")
+        th = threading.Thread(target=beat, daemon=True)
+        th.start()
+        try:
+            t0 = time.time()
+            p = self.guard(FAKE_SEMGREP_SLEEP="9", FAKE_SEMGREP_RC="1")
+            out, err = p.communicate(timeout=60)
+        finally:
+            stop.set()
+        self.assertEqual(p.returncode, 1, err)                  # semgrep's "findings" code, not 124
+        self.assertGreater(time.time() - t0, 8, "the guard must not cut a beating scan short (stale limit is 4 s)")
+        self.assertNotIn("heartbeat lost", err)
+
+
 if __name__ == "__main__":
     unittest.main()

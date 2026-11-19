@@ -247,6 +247,16 @@ baseline as a local run, so the two verdicts cannot disagree. CI installs the ve
   that check's adoption, printed as a warning, the same as a PR that adds the first baseline. A
   version 2 file (written before this change) covers every check except `bandit` and `semgrep`.
 
+**Docker semgrep reads a copy, and never outlives its gate (2026-11-19).** On Windows the Docker scan used to bind-mount
+the checkout. Measured on saluca-content (4,333 tracked files) that bind mount ran semgrep at about 0.1 of a core and a
+full gate never finished inside its caller's 20-minute `timeout` (three runs, exit 124, each leaving a scan container
+running); the same scan over a tar of the tracked files streamed into the container took 30 seconds with the same 28
+findings, and the whole gate on that repo finished in 132 seconds. So the scan now reads a copy: the tracked files the
+gate reads, as the working tree has them, minus files over semgrep's own 1 MB skip. A container the gate started also
+cannot outlive it: it runs under a guard that kills semgrep when the gate's heartbeat (a counter in a read-only mount)
+stops for 3 minutes, the gate removes it on any exit it can see (error, Ctrl-C, SIGTERM, Ctrl-Break), and every run
+first removes labelled scans (`saluca-gate=semgrep`) whose owner process is gone or that outlived the 1 hour cap.
+
 **When a consumer moves its pin past this change:** run
 `python <ci-shared>/tools/gate.py run --repo . --only bandit,semgrep`. Fix what is real, annotate
 reviewed false positives inline with a reason, and record the rest with
