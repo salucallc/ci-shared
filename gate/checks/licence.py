@@ -68,6 +68,9 @@ ALIASES = {
     "fsl-1.1-alv2": "FSL-1.1-ALv2", "fsl-1.1-apache-2.0": "FSL-1.1-ALv2", "licenseref-fsl-1.1-apache-2.0": "FSL-1.1-ALv2",
     "functional source license, version 1.1, apache 2.0 future license": "FSL-1.1-ALv2", "fsl-1.1-mit": "FSL-1.1-MIT",
     "licenseref-fsl-1.1-mit": "FSL-1.1-MIT",
+    # The estate's own SPDX id for a proprietary licence (Cristian, 2026-11-18). It is the same licence
+    # identify() reports for a proprietary LICENSE text. Only this exact id: any other LicenseRef is unmapped.
+    "licenseref-saluca-proprietary": "LicenseRef-Proprietary",
 }
 MENTION = re.compile(r"(?i)\b(MIT|Apache[- ]?(License,? )?(Version )?2(\.0)?|BSD[- ][23][- ]Clause|A?GPL-?v?[23](\.0)?(-only|-or-later)?|"
                      r"LGPL-?v?[23](\.[01])?|MPL-?2\.0|CC[- ]BY(-NC)?(-SA)?[- ]4\.0|CC0(-1\.0)?|Unlicense|ISC|BUSL-1\.1|"
